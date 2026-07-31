@@ -11,7 +11,7 @@ const EXPIRE = EXPIRE_MINUTES === 0
     ? Infinity
     : EXPIRE_MINUTES * 60 * 1000;
 
-// 硬编码参数，不再从后端读取
+// 硬编码参数
 const MAX_RETRIES = 8;
 const RETRY_INTERVAL = 100;
 const RESTORE_DELAY = 80;
@@ -24,6 +24,8 @@ let userInteracted = false;
 let interactionTimer = null;
 let isNavigating = false;
 let pendingRestore = null;
+let hasRestoredOnce = false;        // 标记是否已完成首次恢复
+let restoreScheduled = false;       // 防止重复调度
 
 //------------------------------------------------------------
 
@@ -117,6 +119,16 @@ function saveScroll() {
 }
 
 function restoreScroll(force) {
+    // 非强制恢复时，如果已经恢复过了，不再重复执行
+    if (!force && hasRestoredOnce) {
+        return;
+    }
+
+    if (restoreScheduled) {
+        return;
+    }
+    restoreScheduled = true;
+
     if (pendingRestore) {
         clearTimeout(pendingRestore);
         pendingRestore = null;
@@ -131,6 +143,7 @@ function restoreScroll(force) {
 
     if (!force && userInteracted) {
         pendingRestore = setTimeout(function() {
+            restoreScheduled = false;
             restoreScroll(false);
         }, 300);
         return;
@@ -141,19 +154,26 @@ function restoreScroll(force) {
 
     const info = data[currentPath()];
 
-    if (!info || typeof info.y !== 'number' || info.y < 0)
+    if (!info || typeof info.y !== 'number' || info.y < 0) {
+        restoreScheduled = false;
         return;
+    }
 
     let retry = 0;
 
     function doRestore() {
         if (!force && userInteracted) {
+            restoreScheduled = false;
             return;
         }
         setScrollY(info.y);
         retry++;
         if (retry < MAX_RETRIES) {
             setTimeout(doRestore, RETRY_INTERVAL);
+        } else {
+            // 恢复完成
+            hasRestoredOnce = true;
+            restoreScheduled = false;
         }
     }
 
@@ -162,21 +182,42 @@ function restoreScroll(force) {
     if (window.requestAnimationFrame) {
         requestAnimationFrame(function() {
             setTimeout(function() {
-                if (!force && userInteracted) return;
+                if (!force && userInteracted) {
+                    restoreScheduled = false;
+                    return;
+                }
                 setScrollY(info.y);
+                // 动画帧执行后标记恢复完成
+                setTimeout(function() {
+                    hasRestoredOnce = true;
+                }, 100);
             }, 50);
         });
     }
+
+    // 兜底：即使上面的重试都没成功，最终也标记完成
+    setTimeout(function() {
+        hasRestoredOnce = true;
+        restoreScheduled = false;
+    }, MAX_RETRIES * RETRY_INTERVAL + RESTORE_DELAY + 500);
 }
 
 function prepareNavigation() {
     saveScroll();
     userInteracted = false;
     isNavigating = true;
+    hasRestoredOnce = false;   // 新页面需要重新恢复
+    restoreScheduled = false;
     clearTimeout(interactionTimer);
     setTimeout(function() {
         isNavigating = false;
     }, 1000);
+}
+
+// 重置恢复状态（用于页面切换）
+function resetRestoreState() {
+    hasRestoredOnce = false;
+    restoreScheduled = false;
 }
 
 //------------------------------------------------------------
@@ -236,6 +277,7 @@ function installFolderClickListener() {
 
 function installBackForwardListener() {
     window.addEventListener("popstate", function() {
+        resetRestoreState();
         isNavigating = true;
         setTimeout(function() {
             restoreScroll(true);
@@ -254,6 +296,7 @@ function installUriWatcher() {
 
         if (now !== last) {
             last = now;
+            resetRestoreState();
             isNavigating = true;
             setTimeout(function() {
                 restoreScroll(true);
@@ -271,18 +314,23 @@ installUserInteractionDetector();
 
 document.addEventListener("visibilitychange", function() {
     if (!document.hidden) {
-        isNavigating = true;
-        setTimeout(function() {
-            restoreScroll(true);
+        // 页面可见时，如果还没恢复过，尝试恢复
+        if (!hasRestoredOnce) {
+            resetRestoreState();
+            isNavigating = true;
             setTimeout(function() {
-                isNavigating = false;
-            }, 400);
-        }, 200);
+                restoreScroll(true);
+                setTimeout(function() {
+                    isNavigating = false;
+                }, 400);
+            }, 200);
+        }
     }
 });
 
 window.addEventListener("pageshow", function(e) {
     if (e.persisted) {
+        resetRestoreState();
         isNavigating = true;
         setTimeout(function() {
             restoreScroll(true);
@@ -305,32 +353,73 @@ installFolderClickListener();
 installBackForwardListener();
 installUriWatcher();
 
-setTimeout(function() {
+// 首次加载：等待 DOM 完全渲染后再恢复
+function initialRestore() {
+    resetRestoreState();
     isNavigating = true;
-    restoreScroll(true);
-    setTimeout(function() {
-        isNavigating = false;
-    }, 500);
-}, 300);
-
-if (document.readyState === 'complete') {
-    setTimeout(function() {
-        isNavigating = true;
-        restoreScroll(true);
-        setTimeout(function() {
-            isNavigating = false;
-        }, 500);
-    }, 500);
-} else {
-    window.addEventListener('load', function() {
-        setTimeout(function() {
-            isNavigating = true;
+    
+    // 等待内容稳定后再恢复
+    const startTime = Date.now();
+    let waitInterval = null;
+    
+    function checkAndRestore() {
+        // 检查列表项是否已渲染（根据 HFS 的实际情况调整选择器）
+        const items = document.querySelectorAll('.entry, .folder, .file, [data-path], .listing tbody tr');
+        const elapsed = Date.now() - startTime;
+        
+        // 如果有内容，或者等待超过 2 秒，执行恢复
+        if (items.length > 0 || elapsed > 2000) {
+            if (waitInterval) {
+                clearInterval(waitInterval);
+                waitInterval = null;
+            }
             restoreScroll(true);
             setTimeout(function() {
                 isNavigating = false;
             }, 500);
-        }, 400);
+        }
+    }
+    
+    // 立即检查一次
+    setTimeout(checkAndRestore, 300);
+    
+    // 持续检查
+    waitInterval = setInterval(checkAndRestore, 200);
+    
+    // 兜底：3秒后强制完成
+    setTimeout(function() {
+        if (waitInterval) {
+            clearInterval(waitInterval);
+            waitInterval = null;
+        }
+        if (!hasRestoredOnce) {
+            restoreScroll(true);
+            setTimeout(function() {
+                isNavigating = false;
+            }, 500);
+        }
+    }, 3000);
+}
+
+// 启动首次恢复
+if (document.readyState === 'complete') {
+    setTimeout(initialRestore, 100);
+} else if (document.readyState === 'interactive') {
+    // DOM 可用但资源未加载完
+    document.addEventListener('DOMContentLoaded', function() {
+        setTimeout(initialRestore, 100);
+    });
+} else {
+    window.addEventListener('load', function() {
+        setTimeout(initialRestore, 100);
     });
 }
+
+// 兜底：如果上面的都没触发
+setTimeout(function() {
+    if (!hasRestoredOnce) {
+        initialRestore();
+    }
+}, 1500);
 
 }
