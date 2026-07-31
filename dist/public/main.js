@@ -11,7 +11,6 @@ const EXPIRE = EXPIRE_MINUTES === 0
     ? Infinity
     : EXPIRE_MINUTES * 60 * 1000;
 
-// 硬编码参数
 const MAX_RETRIES = 8;
 const RETRY_INTERVAL = 100;
 const RESTORE_DELAY = 80;
@@ -24,14 +23,18 @@ let userInteracted = false;
 let interactionTimer = null;
 let isNavigating = false;
 let pendingRestore = null;
-let hasRestoredOnce = false;        // 标记是否已完成首次恢复
-let restoreScheduled = false;       // 防止重复调度
+let hasRestoredOnce = false;
+let restoreScheduled = false;
+let currentFolderPath = '';      // 当前文件夹路径（从 API 获取）
+let isFolderPage = false;        // 当前页面是否是文件夹列表
 
 //------------------------------------------------------------
 
 function loadData() {
     try {
-        return JSON.parse(sessionStorage.getItem(STORAGE_KEY) || "{}");
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return {};
+        return JSON.parse(raw);
     }
     catch {
         return {};
@@ -39,11 +42,17 @@ function loadData() {
 }
 
 function saveData(data) {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
 }
 
-function currentPath() {
-    return location.pathname + location.search;
+function getPathFromUrl() {
+    // 从 URL 中提取路径，例如 /Musics/B-Music/
+    try {
+        const url = new URL(location.href);
+        return url.pathname;
+    } catch {
+        return location.pathname;
+    }
 }
 
 function getScrollY() {
@@ -89,6 +98,83 @@ function markUserInteraction() {
 
 //------------------------------------------------------------
 
+// 通过 API 检测当前页面是否是文件夹列表，并获取实际路径
+function detectFolderViaApi(callback) {
+    const path = getPathFromUrl();
+    
+    // 如果是根目录或者明显不是文件夹，先快速判断
+    if (path === '/' || path === '/index.html') {
+        isFolderPage = true;
+        currentFolderPath = '/';
+        if (callback) callback(true);
+        return;
+    }
+
+    // 排除文件（带扩展名且不以 / 结尾）
+    if (path.includes('.') && !path.endsWith('/')) {
+        isFolderPage = false;
+        currentFolderPath = '';
+        if (callback) callback(false);
+        return;
+    }
+
+    // 调用 API 检测
+    const apiUrl = '/~/api/get_file_list?uri=' + encodeURIComponent(path);
+    
+    fetch(apiUrl, {
+        headers: { 'Accept': 'application/json' }
+    })
+    .then(function(res) {
+        if (!res.ok) throw new Error('API error');
+        return res.json();
+    })
+    .then(function(data) {
+        // 有 list 字段且是数组，说明是文件夹
+        if (data && Array.isArray(data.list)) {
+            isFolderPage = true;
+            currentFolderPath = path;
+        } else {
+            isFolderPage = false;
+            currentFolderPath = '';
+        }
+        if (callback) callback(isFolderPage);
+    })
+    .catch(function() {
+        // API 调用失败，回退到 URL 判断
+        if (path.endsWith('/') || path === '') {
+            isFolderPage = true;
+            currentFolderPath = path || '/';
+        } else {
+            isFolderPage = false;
+            currentFolderPath = '';
+        }
+        if (callback) callback(isFolderPage);
+    });
+}
+
+function shouldIgnorePage() {
+    // 如果不是文件夹列表页，忽略
+    if (!isFolderPage) return true;
+    
+    // 排除特殊路径
+    const url = location.href;
+    if (url.includes('?dl')) return true;
+    if (url.includes('?upload')) return true;
+    if (url.includes('/~login')) return true;
+    if (url.includes('/~logout')) return true;
+    if (url.includes('/~upload')) return true;
+    if (url.includes('/~api')) return true;
+    
+    return false;
+}
+
+function getStorageKey() {
+    // 用文件夹路径作为存储 key
+    return currentFolderPath || getPathFromUrl();
+}
+
+//------------------------------------------------------------
+
 function cleanExpired(data) {
     if (EXPIRE === Infinity) return data;
 
@@ -110,8 +196,11 @@ function cleanExpired(data) {
 }
 
 function saveScroll() {
+    if (shouldIgnorePage()) return;
+    
     const data = loadData();
-    data[currentPath()] = {
+    const key = getStorageKey();
+    data[key] = {
         y: getScrollY(),
         time: Date.now()
     };
@@ -119,7 +208,11 @@ function saveScroll() {
 }
 
 function restoreScroll(force) {
-    // 非强制恢复时，如果已经恢复过了，不再重复执行
+    if (shouldIgnorePage()) {
+        hasRestoredOnce = true;
+        return;
+    }
+
     if (!force && hasRestoredOnce) {
         return;
     }
@@ -152,7 +245,8 @@ function restoreScroll(force) {
     const data = loadData();
     cleanExpired(data);
 
-    const info = data[currentPath()];
+    const key = getStorageKey();
+    const info = data[key];
 
     if (!info || typeof info.y !== 'number' || info.y < 0) {
         restoreScheduled = false;
@@ -171,7 +265,6 @@ function restoreScroll(force) {
         if (retry < MAX_RETRIES) {
             setTimeout(doRestore, RETRY_INTERVAL);
         } else {
-            // 恢复完成
             hasRestoredOnce = true;
             restoreScheduled = false;
         }
@@ -187,7 +280,6 @@ function restoreScroll(force) {
                     return;
                 }
                 setScrollY(info.y);
-                // 动画帧执行后标记恢复完成
                 setTimeout(function() {
                     hasRestoredOnce = true;
                 }, 100);
@@ -195,7 +287,6 @@ function restoreScroll(force) {
         });
     }
 
-    // 兜底：即使上面的重试都没成功，最终也标记完成
     setTimeout(function() {
         hasRestoredOnce = true;
         restoreScheduled = false;
@@ -206,7 +297,7 @@ function prepareNavigation() {
     saveScroll();
     userInteracted = false;
     isNavigating = true;
-    hasRestoredOnce = false;   // 新页面需要重新恢复
+    hasRestoredOnce = false;
     restoreScheduled = false;
     clearTimeout(interactionTimer);
     setTimeout(function() {
@@ -214,10 +305,29 @@ function prepareNavigation() {
     }, 1000);
 }
 
-// 重置恢复状态（用于页面切换）
 function resetRestoreState() {
     hasRestoredOnce = false;
     restoreScheduled = false;
+}
+
+// 重新检测当前页面
+function reDetectPage(callback) {
+    detectFolderViaApi(function(success) {
+        if (success) {
+            // 如果是文件夹页，尝试恢复
+            if (!shouldIgnorePage() && !hasRestoredOnce) {
+                resetRestoreState();
+                isNavigating = true;
+                setTimeout(function() {
+                    restoreScroll(true);
+                    setTimeout(function() {
+                        isNavigating = false;
+                    }, 400);
+                }, 100);
+            }
+        }
+        if (callback) callback();
+    });
 }
 
 //------------------------------------------------------------
@@ -226,7 +336,7 @@ function installUserInteractionDetector() {
     let scrollTimer = null;
     
     window.addEventListener("scroll", function() {
-        if (!window._programmaticScroll && !isNavigating) {
+        if (!window._programmaticScroll && !isNavigating && !shouldIgnorePage()) {
             markUserInteraction();
             clearTimeout(scrollTimer);
             scrollTimer = setTimeout(function() {
@@ -269,6 +379,7 @@ function installFolderClickListener() {
         const href = a.getAttribute("href");
         if (!href) return;
         if (href.includes("?dl")) return;
+        if (href.includes("?upload")) return;
         if (href.includes(".") && !href.endsWith("/")) return;
 
         prepareNavigation();
@@ -277,25 +388,8 @@ function installFolderClickListener() {
 
 function installBackForwardListener() {
     window.addEventListener("popstate", function() {
-        resetRestoreState();
-        isNavigating = true;
-        setTimeout(function() {
-            restoreScroll(true);
-            setTimeout(function() {
-                isNavigating = false;
-            }, 400);
-        }, 100);
-    });
-}
-
-function installUriWatcher() {
-    let last = currentPath();
-
-    setInterval(function() {
-        const now = currentPath();
-
-        if (now !== last) {
-            last = now;
+        // 重新检测页面
+        detectFolderViaApi(function() {
             resetRestoreState();
             isNavigating = true;
             setTimeout(function() {
@@ -303,7 +397,32 @@ function installUriWatcher() {
                 setTimeout(function() {
                     isNavigating = false;
                 }, 400);
-            }, 120);
+            }, 100);
+        });
+    });
+}
+
+function installUriWatcher() {
+    let last = getPathFromUrl();
+
+    setInterval(function() {
+        const now = getPathFromUrl();
+
+        if (now !== last) {
+            last = now;
+            // URL 变化，重新检测
+            detectFolderViaApi(function() {
+                if (!shouldIgnorePage()) {
+                    resetRestoreState();
+                    isNavigating = true;
+                    setTimeout(function() {
+                        restoreScroll(true);
+                        setTimeout(function() {
+                            isNavigating = false;
+                        }, 400);
+                    }, 120);
+                }
+            });
         }
     }, URI_WATCH_INTERVAL);
 }
@@ -313,8 +432,7 @@ function installUriWatcher() {
 installUserInteractionDetector();
 
 document.addEventListener("visibilitychange", function() {
-    if (!document.hidden) {
-        // 页面可见时，如果还没恢复过，尝试恢复
+    if (!document.hidden && !shouldIgnorePage()) {
         if (!hasRestoredOnce) {
             resetRestoreState();
             isNavigating = true;
@@ -330,14 +448,18 @@ document.addEventListener("visibilitychange", function() {
 
 window.addEventListener("pageshow", function(e) {
     if (e.persisted) {
-        resetRestoreState();
-        isNavigating = true;
-        setTimeout(function() {
-            restoreScroll(true);
-            setTimeout(function() {
-                isNavigating = false;
-            }, 400);
-        }, 150);
+        detectFolderViaApi(function() {
+            if (!shouldIgnorePage()) {
+                resetRestoreState();
+                isNavigating = true;
+                setTimeout(function() {
+                    restoreScroll(true);
+                    setTimeout(function() {
+                        isNavigating = false;
+                    }, 400);
+                }, 150);
+            }
+        });
     }
 });
 
@@ -353,73 +475,100 @@ installFolderClickListener();
 installBackForwardListener();
 installUriWatcher();
 
-// 首次加载：等待 DOM 完全渲染后再恢复
-function initialRestore() {
-    resetRestoreState();
-    isNavigating = true;
-    
-    // 等待内容稳定后再恢复
-    const startTime = Date.now();
-    let waitInterval = null;
-    
-    function checkAndRestore() {
-        // 检查列表项是否已渲染（根据 HFS 的实际情况调整选择器）
-        const items = document.querySelectorAll('.entry, .folder, .file, [data-path], .listing tbody tr');
-        const elapsed = Date.now() - startTime;
+// 初始化：先检测页面类型，再恢复
+function init() {
+    detectFolderViaApi(function() {
+        if (shouldIgnorePage()) {
+            hasRestoredOnce = true;
+            return;
+        }
+
+        resetRestoreState();
+        isNavigating = true;
         
-        // 如果有内容，或者等待超过 2 秒，执行恢复
-        if (items.length > 0 || elapsed > 2000) {
+        const startTime = Date.now();
+        let waitInterval = null;
+        
+        function checkAndRestore() {
+            const items = document.querySelectorAll('.entry, .folder, .file, [data-path], .listing tbody tr, .table-row');
+            const elapsed = Date.now() - startTime;
+            
+            if (items.length > 0 || elapsed > 2000) {
+                if (waitInterval) {
+                    clearInterval(waitInterval);
+                    waitInterval = null;
+                }
+                restoreScroll(true);
+                setTimeout(function() {
+                    isNavigating = false;
+                }, 500);
+            }
+        }
+        
+        setTimeout(checkAndRestore, 300);
+        waitInterval = setInterval(checkAndRestore, 200);
+        
+        setTimeout(function() {
             if (waitInterval) {
                 clearInterval(waitInterval);
                 waitInterval = null;
             }
-            restoreScroll(true);
-            setTimeout(function() {
-                isNavigating = false;
-            }, 500);
-        }
-    }
-    
-    // 立即检查一次
-    setTimeout(checkAndRestore, 300);
-    
-    // 持续检查
-    waitInterval = setInterval(checkAndRestore, 200);
-    
-    // 兜底：3秒后强制完成
-    setTimeout(function() {
-        if (waitInterval) {
-            clearInterval(waitInterval);
-            waitInterval = null;
-        }
-        if (!hasRestoredOnce) {
-            restoreScroll(true);
-            setTimeout(function() {
-                isNavigating = false;
-            }, 500);
-        }
-    }, 3000);
+            if (!hasRestoredOnce) {
+                restoreScroll(true);
+                setTimeout(function() {
+                    isNavigating = false;
+                }, 500);
+            }
+        }, 3000);
+    });
 }
 
-// 启动首次恢复
+// 根据 DOM 状态启动
 if (document.readyState === 'complete') {
-    setTimeout(initialRestore, 100);
+    setTimeout(init, 100);
 } else if (document.readyState === 'interactive') {
-    // DOM 可用但资源未加载完
     document.addEventListener('DOMContentLoaded', function() {
-        setTimeout(initialRestore, 100);
+        setTimeout(init, 100);
     });
 } else {
     window.addEventListener('load', function() {
-        setTimeout(initialRestore, 100);
+        setTimeout(init, 100);
     });
 }
 
-// 兜底：如果上面的都没触发
 setTimeout(function() {
     if (!hasRestoredOnce) {
-        initialRestore();
+        // 如果还没初始化完成，强制重试
+        detectFolderViaApi(function() {
+            if (!shouldIgnorePage() && !hasRestoredOnce) {
+                init();
+            }
+        });
     }
-}, 1500);
+}, 2000);
+
+// 调试工具
+window.hfsScrollDebug = function() {
+    const data = loadData();
+    console.log('📦 存储的滚动位置:', data);
+    console.log('📌 当前路径:', getPathFromUrl());
+    console.log('📌 文件夹路径:', currentFolderPath);
+    console.log('📌 存储Key:', getStorageKey());
+    console.log('📌 当前滚动位置:', getScrollY());
+    console.log('📌 是否文件夹页:', isFolderPage);
+    console.log('📌 是否忽略:', shouldIgnorePage());
+    console.log('📌 已恢复:', hasRestoredOnce);
+    return data;
+};
+
+// 手动强制恢复
+window.hfsRestore = function() {
+    resetRestoreState();
+    isNavigating = true;
+    restoreScroll(true);
+    setTimeout(function() {
+        isNavigating = false;
+    }, 500);
+};
 
 }
