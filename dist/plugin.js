@@ -1,4 +1,4 @@
-exports.version = 1.0
+exports.version = 1.2
 exports.apiRequired = 8.87
 exports.repo = "Hug3O/Scroll-position-Remember"
 exports.description = "Remember scroll position for every folder."
