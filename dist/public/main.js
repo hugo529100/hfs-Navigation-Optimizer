@@ -11,8 +11,8 @@ const EXPIRE = EXPIRE_MINUTES === 0
     ? Infinity
     : EXPIRE_MINUTES * 60 * 1000;
 
-const MAX_RETRIES = config.maxRetries ?? 8;
-const RETRY_INTERVAL = config.retryInterval ?? 100;
+const MAX_RETRIES = 8;
+const RETRY_INTERVAL = 100;
 const RESTORE_DELAY = 80;
 const URI_WATCH_INTERVAL = 200;
 
@@ -134,8 +134,11 @@ function restoreScroll() {
     const data = loadData();
     const info = data[currentPath()];
 
-    if (!info || typeof info.y !== 'number' || info.y < 0)
+    // 首次进入没有记录 → 滚动到顶部 0
+    if (!info || typeof info.y !== 'number' || info.y < 0) {
+        setScrollY(0);
         return;
+    }
 
     let retry = 0;
 
