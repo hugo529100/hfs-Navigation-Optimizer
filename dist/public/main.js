@@ -8,31 +8,78 @@
         ? HFS.pluginConfig
         : {};
 
-    const EXPIRE_MINUTES = config.expireMinutes ?? 10;
+    const EXPIRE_MINUTES = config.expireMinutes ?? 1440;
     const EXPIRE = EXPIRE_MINUTES === 0
         ? Infinity
         : EXPIRE_MINUTES * 60 * 1000;
 
-    // 文件数量阈值：少于这个数量的文件不记录滚动位置
-    // 没有记录 = 返回顶部（默认行为）
-    const MIN_FILES_THRESHOLD = config.minFilesThreshold ?? 50;
+    const MIN_FILES_THRESHOLD = config.minFilesThreshold ?? 25;
 
     // ============================================================
-    //  内置重试参数
+    //  内置参数
     // ============================================================
     const MAX_RETRIES = 8;
-    const RETRY_INTERVAL = 100;
-    const RESTORE_DELAY = 80;
-    const URI_WATCH_INTERVAL = 200;
+    const RETRY_INTERVAL = 150;
+    const RESTORE_DELAY = 100;
+    const URI_WATCH_INTERVAL = 300;
     const CACHE_DURATION = 10000;
 
     const STORAGE_KEY = "hfs-folder-scroll";
     const META_KEY = "hfs-folder-scroll-meta";
 
     // ============================================================
-    //  文件数量检测 - 通过 HFS API（文件和文件夹都计数）
+    //  状态管理
+    // ============================================================
+    let restorePending = false;
+    let restoreTarget = null;
+    let scrollTimeout = null;
+    let lastSetScrollY = -1;
+    let isRestoring = false;
+
+    // ============================================================
+    //  等待内容稳定
+    // ============================================================
+    function waitForContentStable(callback, maxWait = 3000) {
+        let attempts = 0;
+        let lastHeight = 0;
+        let stableCount = 0;
+        const CHECK_INTERVAL = 100;
+        const STABLE_THRESHOLD = 3;
+
+        function check() {
+            attempts++;
+            const currentHeight = document.documentElement.scrollHeight;
+            
+            const listWrapper = document.querySelector('.list-wrapper');
+            const fileItems = document.querySelectorAll('.file-entry, .folder-entry, [role="row"], .list-item, .entry');
+            
+            if (currentHeight === lastHeight && lastHeight > 100) {
+                stableCount++;
+            } else {
+                stableCount = 0;
+                lastHeight = currentHeight;
+            }
+
+            const hasContent = listWrapper !== null || fileItems.length > 0;
+            const isStable = stableCount >= STABLE_THRESHOLD;
+            const isTimeout = attempts * CHECK_INTERVAL >= maxWait;
+
+            if ((isStable && hasContent) || isTimeout) {
+                callback();
+                return;
+            }
+
+            setTimeout(check, CHECK_INTERVAL);
+        }
+
+        setTimeout(check, 50);
+    }
+
+    // ============================================================
+    //  文件数量检测
     // ============================================================
     const fileCountCache = {};
+    const fileCountFetching = {};
 
     async function getFileCount(path) {
         try {
@@ -44,6 +91,23 @@
                 return fileCountCache[pathWithoutQuery].count;
             }
 
+            if (fileCountFetching[pathWithoutQuery]) {
+                return new Promise((resolve) => {
+                    const checkCache = setInterval(() => {
+                        if (fileCountCache[pathWithoutQuery]) {
+                            clearInterval(checkCache);
+                            resolve(fileCountCache[pathWithoutQuery].count);
+                        }
+                    }, 50);
+                    setTimeout(() => {
+                        clearInterval(checkCache);
+                        resolve(null);
+                    }, 5000);
+                });
+            }
+
+            fileCountFetching[pathWithoutQuery] = true;
+
             const apiUrl = '/~/api/get_file_list?uri=' + encodeURIComponent(pathWithoutQuery);
             
             const response = await fetch(apiUrl, {
@@ -54,16 +118,17 @@
             });
 
             if (!response.ok) {
+                fileCountFetching[pathWithoutQuery] = false;
                 return null;
             }
 
             const data = await response.json();
             
             if (!data || !data.list || !Array.isArray(data.list)) {
+                fileCountFetching[pathWithoutQuery] = false;
                 return null;
             }
 
-            // 文件和文件夹都计数（list 中所有项都算）
             const count = data.list.length;
 
             fileCountCache[pathWithoutQuery] = {
@@ -71,8 +136,10 @@
                 time: now
             };
 
+            fileCountFetching[pathWithoutQuery] = false;
             return count;
         } catch (error) {
+            fileCountFetching[pathWithoutQuery] = false;
             return null;
         }
     }
@@ -86,11 +153,9 @@
         return null;
     }
 
-    // 判断是否应该跳过保存滚动位置
     function shouldSkipSaveSync(path) {
         const count = getCachedFileCount(path);
         if (count === null) {
-            // 没有缓存时，保守处理：不跳过（允许保存）
             return false;
         }
         return count < MIN_FILES_THRESHOLD;
@@ -156,25 +221,44 @@
             || 0;
     }
 
+    // ============================================================
+    //  setScrollY 防抖
+    // ============================================================
+
     function setScrollY(y) {
+        const targetY = Math.max(0, y);
+        
+        if (Math.abs(lastSetScrollY - targetY) < 2) {
+            return;
+        }
+        lastSetScrollY = targetY;
+
+        if (scrollTimeout) {
+            clearTimeout(scrollTimeout);
+        }
+
+        doSetScrollY(targetY);
+
+        scrollTimeout = setTimeout(() => {
+            doSetScrollY(targetY);
+            scrollTimeout = null;
+        }, 80);
+    }
+
+    function doSetScrollY(y) {
+        const targetY = Math.max(0, y);
+        
         window.scrollTo({
-            top: y,
+            top: targetY,
             behavior: "instant"
         });
 
         if (document.documentElement) {
-            document.documentElement.scrollTop = y;
+            document.documentElement.scrollTop = targetY;
         }
         if (document.body) {
-            document.body.scrollTop = y;
+            document.body.scrollTop = targetY;
         }
-
-        setTimeout(function() {
-            window.scrollTo({
-                top: y,
-                behavior: "instant"
-            });
-        }, 10);
     }
 
     // ============================================================
@@ -211,7 +295,6 @@
     async function saveScroll() {
         const path = currentPath();
         
-        // 文件数量少于阈值 → 不保存
         const skip = await shouldSkipSave(path);
         if (skip) {
             return;
@@ -240,55 +323,163 @@
         saveData(data);
     }
 
-    async function restoreScroll() {
-        const path = currentPath();
-        
-        cleanExpired();
-
-        const data = loadData();
-        const info = data[path];
-
-        // 没有记录 → 返回顶部（默认行为）
-        if (!info || typeof info.y !== 'number' || info.y < 0) {
-            setScrollY(0);
-            return;
-        }
-
-        let retry = 0;
-
-        function restore() {
-            setScrollY(info.y);
-            retry++;
-            if (retry < MAX_RETRIES)
-                setTimeout(restore, RETRY_INTERVAL);
-        }
-
-        setTimeout(restore, RESTORE_DELAY);
-
-        if (window.requestAnimationFrame) {
-            requestAnimationFrame(function() {
-                setTimeout(function() {
-                    setScrollY(info.y);
-                }, 50);
-            });
-        }
-    }
+    // ============================================================
+    //  恢复滚动（带内容稳定等待）
+    // ============================================================
 
     function restoreScrollSync() {
         const path = currentPath();
         
+        if (isRestoring) {
+            return;
+        }
+
         cleanExpired();
 
         const data = loadData();
         const info = data[path];
 
-        // 没有记录 → 返回顶部（默认行为）
         if (!info || typeof info.y !== 'number' || info.y < 0) {
             setScrollY(0);
             return;
         }
 
-        setScrollY(info.y);
+        isRestoring = true;
+
+        waitForContentStable(() => {
+            const currentPathNow = currentPath();
+            if (currentPathNow !== path) {
+                isRestoring = false;
+                return;
+            }
+
+            const dataNow = loadData();
+            const infoNow = dataNow[path];
+            if (!infoNow || typeof infoNow.y !== 'number' || infoNow.y < 0) {
+                isRestoring = false;
+                return;
+            }
+
+            setScrollY(infoNow.y);
+
+            let retry = 0;
+            function retryRestore() {
+                if (retry >= MAX_RETRIES) {
+                    isRestoring = false;
+                    return;
+                }
+                if (currentPath() !== path) {
+                    isRestoring = false;
+                    return;
+                }
+                const dataRetry = loadData();
+                const infoRetry = dataRetry[path];
+                if (infoRetry && typeof infoRetry.y === 'number' && infoRetry.y >= 0) {
+                    setScrollY(infoRetry.y);
+                }
+                retry++;
+                setTimeout(retryRestore, RETRY_INTERVAL);
+            }
+
+            setTimeout(retryRestore, RESTORE_DELAY);
+
+            if (window.requestAnimationFrame) {
+                requestAnimationFrame(function() {
+                    setTimeout(function() {
+                        if (currentPath() === path) {
+                            const dataRaf = loadData();
+                            const infoRaf = dataRaf[path];
+                            if (infoRaf && typeof infoRaf.y === 'number' && infoRaf.y >= 0) {
+                                setScrollY(infoRaf.y);
+                            }
+                        }
+                    }, 80);
+                });
+            }
+
+            setTimeout(() => {
+                isRestoring = false;
+            }, 600);
+        }, 3500);
+    }
+
+    async function restoreScroll() {
+        const path = currentPath();
+        
+        if (isRestoring) {
+            return;
+        }
+
+        cleanExpired();
+
+        const data = loadData();
+        const info = data[path];
+
+        if (!info || typeof info.y !== 'number' || info.y < 0) {
+            setScrollY(0);
+            return;
+        }
+
+        isRestoring = true;
+
+        await new Promise((resolve) => {
+            waitForContentStable(() => {
+                resolve();
+            }, 3500);
+        });
+
+        if (currentPath() !== path) {
+            isRestoring = false;
+            return;
+        }
+
+        const dataNow = loadData();
+        const infoNow = dataNow[path];
+        if (!infoNow || typeof infoNow.y !== 'number' || infoNow.y < 0) {
+            isRestoring = false;
+            return;
+        }
+
+        setScrollY(infoNow.y);
+
+        let retry = 0;
+        function retryRestore() {
+            if (retry >= MAX_RETRIES) {
+                isRestoring = false;
+                return;
+            }
+            if (currentPath() !== path) {
+                isRestoring = false;
+                return;
+            }
+            const dataRetry = loadData();
+            const infoRetry = dataRetry[path];
+            if (infoRetry && typeof infoRetry.y === 'number' && infoRetry.y >= 0) {
+                setScrollY(infoRetry.y);
+            }
+            retry++;
+            setTimeout(retryRestore, RETRY_INTERVAL);
+        }
+
+        setTimeout(retryRestore, RESTORE_DELAY);
+
+        if (window.requestAnimationFrame) {
+            requestAnimationFrame(function() {
+                setTimeout(function() {
+                    if (currentPath() === path) {
+                        const dataRaf = loadData();
+                        const infoRaf = dataRaf[path];
+                        if (infoRaf && typeof infoRaf.y === 'number' && infoRaf.y >= 0) {
+                            setScrollY(infoRaf.y);
+                        }
+                    }
+                }, 80);
+            });
+        }
+
+        setTimeout(() => {
+            isRestoring = false;
+        }, 600);
     }
 
     function installDailyCleaner() {
@@ -336,7 +527,7 @@
         window.addEventListener("popstate", function() {
             setTimeout(function() {
                 restoreScrollSync();
-            }, 100);
+            }, 150);
         });
     }
 
@@ -351,7 +542,7 @@
                 preloadFileCount();
                 setTimeout(function() {
                     restoreScrollSync();
-                }, 120);
+                }, 200);
             }
         }, URI_WATCH_INTERVAL);
     }
@@ -361,23 +552,22 @@
     // ============================================================
 
     const ScrollPluginAPI = {
-        // 判断路径是否应该跳过保存
         shouldSkipSave: function(path) {
             return shouldSkipSaveSync(path);
         },
         shouldSkipSaveAsync: async function(path) {
             return await shouldSkipSave(path);
         },
-        // 保存当前滚动（同步/异步）
         saveScrollSync: saveScrollSync,
         saveScroll: saveScroll,
-        // 恢复滚动（同步/异步）
         restoreScrollSync: restoreScrollSync,
         restoreScroll: restoreScroll,
-        // 工具方法
         getFileCount: getFileCount,
         getThreshold: function() {
             return MIN_FILES_THRESHOLD;
+        },
+        isRestoring: function() {
+            return isRestoring;
         }
     };
 
@@ -393,7 +583,7 @@
         if (!document.hidden) {
             setTimeout(function() {
                 restoreScrollSync();
-            }, 200);
+            }, 300);
         }
     });
 
@@ -401,7 +591,7 @@
         if (e.persisted) {
             setTimeout(function() {
                 restoreScrollSync();
-            }, 150);
+            }, 200);
         }
     });
 
@@ -417,13 +607,13 @@
     installBackForwardListener();
     installUriWatcher();
 
-    setTimeout(restoreScrollSync, 300);
+    setTimeout(restoreScrollSync, 400);
 
     if (document.readyState === 'complete') {
-        setTimeout(restoreScrollSync, 500);
+        setTimeout(restoreScrollSync, 600);
     } else {
         window.addEventListener('load', function() {
-            setTimeout(restoreScrollSync, 400);
+            setTimeout(restoreScrollSync, 500);
         });
     }
 
