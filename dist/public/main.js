@@ -44,7 +44,9 @@
     let restoreTimer = null;
     let isDialogOpen = false;
     let pendingRestoreTimers = [];
-    let scrollSaveTimer = null; // 滾動保存防抖定時器
+    let scrollSaveTimer = null;
+    let animationFrameId = null; // 用於追蹤動畫幀
+    let isAnimating = false; // 防止動畫衝突
 
     // ---- Data functions ----
     function loadData() {
@@ -104,11 +106,24 @@
             clearTimeout(restoreTimer);
             restoreTimer = null;
         }
+        
+        // 取消動畫
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+            isAnimating = false;
+        }
+        
         isRestoring = false;
     }
 
     // ---- 安全的 setTimeout（可追蹤） ----
     function scheduleRestore(delay) {
+        // 如果已經在恢復中，先取消舊的
+        if (isRestoring) {
+            cancelAllPendingRestores();
+        }
+        
         var timer = setTimeout(function() {
             var index = pendingRestoreTimers.indexOf(timer);
             if (index > -1) {
@@ -131,10 +146,17 @@
         }
     }
 
-    // ---- 平滑滾動 ----
+    // ---- 平滑滾動（優化版） ----
     function smoothSetScrollY(targetY) {
         updateDialogState();
         if (isDialogOpen) return;
+
+        // 取消正在進行的動畫
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+            isAnimating = false;
+        }
 
         const startY = window.pageYOffset
             || document.documentElement.scrollTop
@@ -159,6 +181,7 @@
         const EASING = 'easeOutQuart';
 
         const startTime = performance.now();
+        isAnimating = true;
 
         const easingMap = {
             easeOutQuad: function(t) { return 1 - Math.pow(1 - t, 2); },
@@ -170,8 +193,15 @@
         const easingFn = easingMap[EASING] || easingMap.easeOutQuart;
 
         function step(currentTime) {
+            // 如果動畫已被取消，停止執行
+            if (!isAnimating) return;
+            
             updateDialogState();
-            if (isDialogOpen) return;
+            if (isDialogOpen) {
+                isAnimating = false;
+                animationFrameId = null;
+                return;
+            }
 
             const elapsed = currentTime - startTime;
             const progress = Math.min(elapsed / DURATION, 1);
@@ -186,9 +216,11 @@
                 document.body.scrollTop = currentY;
             }
 
-            if (progress < 1) {
-                requestAnimationFrame(step);
+            if (progress < 1 && isAnimating) {
+                animationFrameId = requestAnimationFrame(step);
             } else {
+                isAnimating = false;
+                animationFrameId = null;
                 window.scrollTo({ top: targetY, behavior: "instant" });
                 if (document.documentElement) {
                     document.documentElement.scrollTop = targetY;
@@ -199,7 +231,7 @@
             }
         }
 
-        requestAnimationFrame(step);
+        animationFrameId = requestAnimationFrame(step);
     }
 
     // ---- 清理過期記錄 ----
@@ -230,12 +262,14 @@
         saveMeta(meta);
     }
 
-    // ---- 保存滾動位置 ----
+    // ---- 保存滾動位置（防抖優化） ----
     function saveScroll() {
         if (!ENABLE_SCROLL_REMEMBER) return;
+        if (isRestoring) return;
+        if (isAnimating) return; // 動畫中不保存
+        
         updateDialogState();
         if (isDialogOpen) return;
-        if (isRestoring) return; // 恢復過程中不保存
 
         const data = loadData();
         data[currentPath()] = {
@@ -245,20 +279,31 @@
         saveData(data);
     }
 
+    // ---- 延遲保存（防抖） ----
+    function debouncedSaveScroll() {
+        if (scrollSaveTimer) {
+            clearTimeout(scrollSaveTimer);
+        }
+        scrollSaveTimer = setTimeout(function() {
+            scrollSaveTimer = null;
+            saveScroll();
+        }, 500);
+    }
+
     // ---- 恢復滾動位置 ----
     function restoreScroll() {
         if (!ENABLE_SCROLL_REMEMBER) return;
+        if (isRestoring) return; // 避免重複
+        
         updateDialogState();
         if (isDialogOpen) return;
 
         const path = currentPath();
 
-        if (isRestoring) {
-            if (restoreTimer) {
-                clearTimeout(restoreTimer);
-                restoreTimer = null;
-            }
-            isRestoring = false;
+        // 清除舊的恢復計時器
+        if (restoreTimer) {
+            clearTimeout(restoreTimer);
+            restoreTimer = null;
         }
 
         cleanExpired();
@@ -295,6 +340,7 @@
             }, 300);
         }, RESTORE_DELAY);
 
+        // 超時保護
         setTimeout(function() {
             if (isRestoring) {
                 isRestoring = false;
@@ -321,23 +367,26 @@
         }, 60000);
     }
 
-    // ---- 滾動監聽（實時保存） ----
+    // ---- 滾動監聽（優化版） ----
     function installScrollListener() {
         if (!ENABLE_SCROLL_REMEMBER) return;
+
+        let ticking = false;
 
         window.addEventListener('scroll', function() {
             updateDialogState();
             if (isDialogOpen) return;
             if (isRestoring) return;
+            if (isAnimating) return;
 
-            // 防抖：用戶停止滾動 500ms 後保存
-            if (scrollSaveTimer) {
-                clearTimeout(scrollSaveTimer);
+            // 使用 requestAnimationFrame 節流
+            if (!ticking) {
+                window.requestAnimationFrame(function() {
+                    debouncedSaveScroll();
+                    ticking = false;
+                });
+                ticking = true;
             }
-            scrollSaveTimer = setTimeout(function() {
-                scrollSaveTimer = null;
-                saveScroll();
-            }, 500);
         }, { passive: true });
     }
 
@@ -354,6 +403,7 @@
             if (href.includes("?dl")) return;
             if (href.includes(".") && !href.endsWith("/")) return;
 
+            // 直接保存，不用防抖
             saveScroll();
         }, true);
     }
@@ -362,6 +412,8 @@
         if (!ENABLE_SCROLL_REMEMBER) return;
 
         window.addEventListener("popstate", function() {
+            // 取消所有待執行的恢復，避免堆積
+            cancelAllPendingRestores();
             scheduleRestore(100);
         });
     }
@@ -370,13 +422,21 @@
         if (!ENABLE_SCROLL_REMEMBER) return;
 
         let last = currentPath();
+        let isProcessing = false;
 
         setInterval(function() {
+            // 防止同時執行多個檢查
+            if (isProcessing) return;
+            
             const now = currentPath();
 
             if (now !== last) {
+                isProcessing = true;
                 last = now;
+                // 取消舊的恢復，避免堆積
+                cancelAllPendingRestores();
                 scheduleRestore(120);
+                isProcessing = false;
             }
         }, URI_WATCH_INTERVAL);
     }
@@ -386,16 +446,18 @@
         if (!ENABLE_SCROLL_REMEMBER) return;
 
         installDailyCleaner();
-        installScrollListener(); // 新增：滾動監聽
+        installScrollListener();
 
         document.addEventListener("visibilitychange", function() {
             if (!document.hidden) {
+                cancelAllPendingRestores();
                 scheduleRestore(200);
             }
         });
 
         window.addEventListener("pageshow", function(e) {
             if (e.persisted) {
+                cancelAllPendingRestores();
                 scheduleRestore(150);
             }
         });
@@ -412,15 +474,16 @@
         installBackForwardListener();
         installUriWatcher();
 
-        scheduleRestore(300);
-
+        // 初始恢復 - 只執行一次有效的
         if (document.readyState === 'complete') {
-            scheduleRestore(500);
-            scheduleRestore(1000);
+            setTimeout(function() {
+                scheduleRestore(500);
+            }, 100);
         } else {
             window.addEventListener('load', function() {
-                scheduleRestore(400);
-                scheduleRestore(900);
+                setTimeout(function() {
+                    scheduleRestore(400);
+                }, 100);
             });
         }
     }
@@ -433,6 +496,7 @@
 
     function restoreForGesture() {
         if (!ENABLE_SCROLL_REMEMBER) return;
+        cancelAllPendingRestores();
         scheduleRestore(300);
     }
 
@@ -639,7 +703,7 @@
 
                 addDebugStyles();
             } catch (e) {
-                console.error('Gesture navigation initialization failed:', e);
+                // 靜默處理初始化失敗
             }
         }
 
@@ -680,17 +744,20 @@
         if (typeof window !== 'undefined') {
             window.__CombinedPlugin = CombinedPluginAPI;
         }
-
-        console.log('[Navigation Optimizer] Initialized:',
-            'Scroll=' + (ENABLE_SCROLL_REMEMBER ? 'ON' : 'OFF'),
-            'Gesture=' + (ENABLE_GESTURE_NAVIGATION ? 'ON' : 'OFF')
-        );
     }
 
-    if (document.readyState === 'complete') {
-        init();
-    } else {
-        window.addEventListener('load', init);
-        document.addEventListener('DOMContentLoaded', init);
+    // 防止多次初始化
+    let initialized = false;
+    function safeInit() {
+        if (initialized) return;
+        initialized = true;
+        
+        if (document.readyState === 'complete') {
+            init();
+        } else {
+            window.addEventListener('load', init);
+        }
     }
+
+    safeInit();
 }
