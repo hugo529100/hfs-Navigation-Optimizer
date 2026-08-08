@@ -41,7 +41,10 @@
 
     // ---- 狀態管理 ----
     let isRestoring = false;
-    let currentRestorePath = null;
+    let restoreTimer = null;
+    let isDialogOpen = false;
+    let pendingRestoreTimers = [];
+    let scrollSaveTimer = null; // 滾動保存防抖定時器
 
     // ---- Data functions ----
     function loadData() {
@@ -90,8 +93,49 @@
             || 0;
     }
 
-    // ---- 平滑滾動（只做視覺平滑，不干擾觸發機制） ----
+    // ---- 取消所有待執行的恢復 ----
+    function cancelAllPendingRestores() {
+        pendingRestoreTimers.forEach(function(timer) {
+            clearTimeout(timer);
+        });
+        pendingRestoreTimers = [];
+        
+        if (restoreTimer) {
+            clearTimeout(restoreTimer);
+            restoreTimer = null;
+        }
+        isRestoring = false;
+    }
+
+    // ---- 安全的 setTimeout（可追蹤） ----
+    function scheduleRestore(delay) {
+        var timer = setTimeout(function() {
+            var index = pendingRestoreTimers.indexOf(timer);
+            if (index > -1) {
+                pendingRestoreTimers.splice(index, 1);
+            }
+            restoreScroll();
+        }, delay);
+        pendingRestoreTimers.push(timer);
+        return timer;
+    }
+
+    // ---- 檢查對話框狀態 ----
+    function updateDialogState() {
+        var dialog = document.querySelector('.dialog-backdrop.file-show');
+        var wasOpen = isDialogOpen;
+        isDialogOpen = dialog !== null && dialog.offsetParent !== null;
+        
+        if (isDialogOpen && !wasOpen) {
+            cancelAllPendingRestores();
+        }
+    }
+
+    // ---- 平滑滾動 ----
     function smoothSetScrollY(targetY) {
+        updateDialogState();
+        if (isDialogOpen) return;
+
         const startY = window.pageYOffset
             || document.documentElement.scrollTop
             || document.body.scrollTop
@@ -111,13 +155,8 @@
             return;
         }
 
-        // ============================================================
-        //  可調整參數
-        // ============================================================
-        const DURATION = 800;      // 持續時間 (ms)，建議 300~800
-        // 緩動函數: 'easeOutQuad', 'easeOutCubic', 'easeOutQuart', 'easeOutQuint'
+        const DURATION = 800;
         const EASING = 'easeOutQuart';
-        // ============================================================
 
         const startTime = performance.now();
 
@@ -131,6 +170,9 @@
         const easingFn = easingMap[EASING] || easingMap.easeOutQuart;
 
         function step(currentTime) {
+            updateDialogState();
+            if (isDialogOpen) return;
+
             const elapsed = currentTime - startTime;
             const progress = Math.min(elapsed / DURATION, 1);
             const easedProgress = easingFn(progress);
@@ -147,7 +189,6 @@
             if (progress < 1) {
                 requestAnimationFrame(step);
             } else {
-                // 最終確保到達目標位置
                 window.scrollTo({ top: targetY, behavior: "instant" });
                 if (document.documentElement) {
                     document.documentElement.scrollTop = targetY;
@@ -192,6 +233,9 @@
     // ---- 保存滾動位置 ----
     function saveScroll() {
         if (!ENABLE_SCROLL_REMEMBER) return;
+        updateDialogState();
+        if (isDialogOpen) return;
+        if (isRestoring) return; // 恢復過程中不保存
 
         const data = loadData();
         data[currentPath()] = {
@@ -201,15 +245,20 @@
         saveData(data);
     }
 
-    // ---- 恢復滾動位置（每次進入都平滑滾動，只嘗試 1 次） ----
+    // ---- 恢復滾動位置 ----
     function restoreScroll() {
         if (!ENABLE_SCROLL_REMEMBER) return;
+        updateDialogState();
+        if (isDialogOpen) return;
 
         const path = currentPath();
 
-        // 如果正在恢復中，跳過
         if (isRestoring) {
-            return;
+            if (restoreTimer) {
+                clearTimeout(restoreTimer);
+                restoreTimer = null;
+            }
+            isRestoring = false;
         }
 
         cleanExpired();
@@ -223,31 +272,36 @@
 
         const targetY = Math.max(0, info.y);
 
-        // 標記正在恢復
         isRestoring = true;
-        currentRestorePath = path;
 
-        // 延遲執行恢復
-        setTimeout(function() {
-            // 檢查路徑是否變化
+        restoreTimer = setTimeout(function() {
+            restoreTimer = null;
+
             if (currentPath() !== path) {
                 isRestoring = false;
                 return;
             }
 
-            // 執行平滑滾動（只一次）
+            updateDialogState();
+            if (isDialogOpen) {
+                isRestoring = false;
+                return;
+            }
+
             smoothSetScrollY(targetY);
 
-            // 釋放鎖
             setTimeout(function() {
                 isRestoring = false;
-            }, 100);
+            }, 300);
         }, RESTORE_DELAY);
 
-        // 安全機制：防止鎖永遠不釋放
         setTimeout(function() {
-            if (currentRestorePath === path && isRestoring) {
+            if (isRestoring) {
                 isRestoring = false;
+                if (restoreTimer) {
+                    clearTimeout(restoreTimer);
+                    restoreTimer = null;
+                }
             }
         }, 3000);
     }
@@ -265,6 +319,26 @@
                 cleanExpired();
             }
         }, 60000);
+    }
+
+    // ---- 滾動監聽（實時保存） ----
+    function installScrollListener() {
+        if (!ENABLE_SCROLL_REMEMBER) return;
+
+        window.addEventListener('scroll', function() {
+            updateDialogState();
+            if (isDialogOpen) return;
+            if (isRestoring) return;
+
+            // 防抖：用戶停止滾動 500ms 後保存
+            if (scrollSaveTimer) {
+                clearTimeout(scrollSaveTimer);
+            }
+            scrollSaveTimer = setTimeout(function() {
+                scrollSaveTimer = null;
+                saveScroll();
+            }, 500);
+        }, { passive: true });
     }
 
     // ---- 事件監聽 ----
@@ -288,9 +362,7 @@
         if (!ENABLE_SCROLL_REMEMBER) return;
 
         window.addEventListener("popstate", function() {
-            setTimeout(function() {
-                restoreScroll();
-            }, 100);
+            scheduleRestore(100);
         });
     }
 
@@ -304,9 +376,7 @@
 
             if (now !== last) {
                 last = now;
-                setTimeout(function() {
-                    restoreScroll();
-                }, 120);
+                scheduleRestore(120);
             }
         }, URI_WATCH_INTERVAL);
     }
@@ -316,20 +386,17 @@
         if (!ENABLE_SCROLL_REMEMBER) return;
 
         installDailyCleaner();
+        installScrollListener(); // 新增：滾動監聽
 
         document.addEventListener("visibilitychange", function() {
             if (!document.hidden) {
-                setTimeout(function() {
-                    restoreScroll();
-                }, 200);
+                scheduleRestore(200);
             }
         });
 
         window.addEventListener("pageshow", function(e) {
             if (e.persisted) {
-                setTimeout(function() {
-                    restoreScroll();
-                }, 150);
+                scheduleRestore(150);
             }
         });
 
@@ -345,13 +412,15 @@
         installBackForwardListener();
         installUriWatcher();
 
-        setTimeout(restoreScroll, 300);
+        scheduleRestore(300);
 
         if (document.readyState === 'complete') {
-            setTimeout(restoreScroll, 500);
+            scheduleRestore(500);
+            scheduleRestore(1000);
         } else {
             window.addEventListener('load', function() {
-                setTimeout(restoreScroll, 400);
+                scheduleRestore(400);
+                scheduleRestore(900);
             });
         }
     }
@@ -364,9 +433,7 @@
 
     function restoreForGesture() {
         if (!ENABLE_SCROLL_REMEMBER) return;
-        setTimeout(function() {
-            restoreScroll();
-        }, 300);
+        scheduleRestore(300);
     }
 
     // ============================================================
