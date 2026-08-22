@@ -10,11 +10,13 @@
 
     const ENABLE_SCROLL_REMEMBER = config.enableScrollRemember !== false;
     const ENABLE_GESTURE_NAVIGATION = config.enableGestureNavigation !== false;
+    const ENABLE_TILE_MODE_MEMORY = config.enableTileModeMemory !== false;
 
-    const EXPIRE_MINUTES = config.scrollExpireMinutes ?? 10;
-    const EXPIRE = EXPIRE_MINUTES === 0
+    // 從小時轉換為毫秒
+    const EXPIRE_HOURS = config.expireHours ?? 24;
+    const EXPIRE = EXPIRE_HOURS === 0
         ? Infinity
-        : EXPIRE_MINUTES * 60 * 1000;
+        : EXPIRE_HOURS * 60 * 60 * 1000;
 
     // ============================================================
     //  Gesture Navigation Settings (Hardcoded)
@@ -45,8 +47,8 @@
     let isDialogOpen = false;
     let pendingRestoreTimers = [];
     let scrollSaveTimer = null;
-    let animationFrameId = null; // 用於追蹤動畫幀
-    let isAnimating = false; // 防止動畫衝突
+    let animationFrameId = null;
+    let isAnimating = false;
 
     // ---- Data functions ----
     function loadData() {
@@ -107,7 +109,6 @@
             restoreTimer = null;
         }
         
-        // 取消動畫
         if (animationFrameId) {
             cancelAnimationFrame(animationFrameId);
             animationFrameId = null;
@@ -119,7 +120,6 @@
 
     // ---- 安全的 setTimeout（可追蹤） ----
     function scheduleRestore(delay) {
-        // 如果已經在恢復中，先取消舊的
         if (isRestoring) {
             cancelAllPendingRestores();
         }
@@ -151,7 +151,6 @@
         updateDialogState();
         if (isDialogOpen) return;
 
-        // 取消正在進行的動畫
         if (animationFrameId) {
             cancelAnimationFrame(animationFrameId);
             animationFrameId = null;
@@ -193,7 +192,6 @@
         const easingFn = easingMap[EASING] || easingMap.easeOutQuart;
 
         function step(currentTime) {
-            // 如果動畫已被取消，停止執行
             if (!isAnimating) return;
             
             updateDialogState();
@@ -234,39 +232,59 @@
         animationFrameId = requestAnimationFrame(step);
     }
 
-    // ---- 清理過期記錄 ----
+    // ---- 清理過期記錄（優化版） ----
     function cleanExpired() {
         if (EXPIRE === Infinity) return;
 
-        const meta = loadMeta();
-        const today = getTodayStr();
-
-        if (meta.lastClean === today) return;
-
-        const data = loadData();
         const now = Date.now();
-        let changed = false;
+        let scrollChanged = false;
+        let tileChanged = false;
 
-        for (const key in data) {
-            if (now - data[key].time > EXPIRE) {
-                delete data[key];
-                changed = true;
+        // 清理滾動記錄
+        const scrollData = loadData();
+        for (const key in scrollData) {
+            if (now - scrollData[key].time > EXPIRE) {
+                delete scrollData[key];
+                scrollChanged = true;
+            }
+        }
+        if (scrollChanged) {
+            saveData(scrollData);
+        }
+
+        // 清理 Tile 記錄
+        if (ENABLE_TILE_MODE_MEMORY) {
+            const tileData = loadTileData();
+            for (const key in tileData) {
+                if (now - tileData[key].time > EXPIRE) {
+                    delete tileData[key];
+                    tileChanged = true;
+                }
+            }
+            if (tileChanged) {
+                saveTileData(tileData);
             }
         }
 
-        if (changed) {
-            saveData(data);
+        // 更新清理時間標記（只記錄日期）
+        const meta = loadMeta();
+        const today = getTodayStr();
+        if (meta.lastClean !== today) {
+            meta.lastClean = today;
+            saveMeta(meta);
         }
+    }
 
-        meta.lastClean = today;
-        saveMeta(meta);
+    // ---- 強制清理所有過期記錄（供外部調用） ----
+    function forceCleanExpired() {
+        cleanExpired();
     }
 
     // ---- 保存滾動位置（防抖優化） ----
     function saveScroll() {
         if (!ENABLE_SCROLL_REMEMBER) return;
         if (isRestoring) return;
-        if (isAnimating) return; // 動畫中不保存
+        if (isAnimating) return;
         
         updateDialogState();
         if (isDialogOpen) return;
@@ -293,19 +311,19 @@
     // ---- 恢復滾動位置 ----
     function restoreScroll() {
         if (!ENABLE_SCROLL_REMEMBER) return;
-        if (isRestoring) return; // 避免重複
+        if (isRestoring) return;
         
         updateDialogState();
         if (isDialogOpen) return;
 
         const path = currentPath();
 
-        // 清除舊的恢復計時器
         if (restoreTimer) {
             clearTimeout(restoreTimer);
             restoreTimer = null;
         }
 
+        // 每次恢復前都清理過期記錄
         cleanExpired();
 
         const data = loadData();
@@ -340,7 +358,6 @@
             }, 300);
         }, RESTORE_DELAY);
 
-        // 超時保護
         setTimeout(function() {
             if (isRestoring) {
                 isRestoring = false;
@@ -352,19 +369,50 @@
         }, 3000);
     }
 
-    // ---- 每日清理器 ----
+    // ---- 每日清理器（放緩檢查頻率） ----
     function installDailyCleaner() {
         if (EXPIRE === Infinity) return;
 
+        // 初始清理
         cleanExpired();
 
+        // 每 30 分鐘檢查一次是否需要清理（放緩頻率）
         setInterval(function() {
             const meta = loadMeta();
             const today = getTodayStr();
+            // 如果日期變了，執行清理
             if (meta.lastClean !== today) {
                 cleanExpired();
+            } else {
+                // 檢查是否有記錄過期（只在日期未變時檢查）
+                const now = Date.now();
+                const scrollData = loadData();
+                let needsClean = false;
+                
+                // 檢查滾動記錄
+                for (const key in scrollData) {
+                    if (now - scrollData[key].time > EXPIRE) {
+                        needsClean = true;
+                        break;
+                    }
+                }
+                
+                // 檢查 Tile 記錄
+                if (!needsClean && ENABLE_TILE_MODE_MEMORY) {
+                    const tileData = loadTileData();
+                    for (const key in tileData) {
+                        if (now - tileData[key].time > EXPIRE) {
+                            needsClean = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if (needsClean) {
+                    cleanExpired();
+                }
             }
-        }, 60000);
+        }, 1800000); // 30分鐘檢查一次
     }
 
     // ---- 滾動監聽（優化版） ----
@@ -379,7 +427,6 @@
             if (isRestoring) return;
             if (isAnimating) return;
 
-            // 使用 requestAnimationFrame 節流
             if (!ticking) {
                 window.requestAnimationFrame(function() {
                     debouncedSaveScroll();
@@ -403,7 +450,6 @@
             if (href.includes("?dl")) return;
             if (href.includes(".") && !href.endsWith("/")) return;
 
-            // 直接保存，不用防抖
             saveScroll();
         }, true);
     }
@@ -412,7 +458,6 @@
         if (!ENABLE_SCROLL_REMEMBER) return;
 
         window.addEventListener("popstate", function() {
-            // 取消所有待執行的恢復，避免堆積
             cancelAllPendingRestores();
             scheduleRestore(100);
         });
@@ -425,7 +470,6 @@
         let isProcessing = false;
 
         setInterval(function() {
-            // 防止同時執行多個檢查
             if (isProcessing) return;
             
             const now = currentPath();
@@ -433,7 +477,6 @@
             if (now !== last) {
                 isProcessing = true;
                 last = now;
-                // 取消舊的恢復，避免堆積
                 cancelAllPendingRestores();
                 scheduleRestore(120);
                 isProcessing = false;
@@ -474,7 +517,6 @@
         installBackForwardListener();
         installUriWatcher();
 
-        // 初始恢復 - 只執行一次有效的
         if (document.readyState === 'complete') {
             setTimeout(function() {
                 scheduleRestore(500);
@@ -498,6 +540,137 @@
         if (!ENABLE_SCROLL_REMEMBER) return;
         cancelAllPendingRestores();
         scheduleRestore(300);
+    }
+
+    // ============================================================
+    //  Tile Mode Memory Module
+    // ============================================================
+    const TILE_STORAGE_KEY = 'hfs-folder-tile-mode';
+    let tileChanging = false;
+    let currentTileUri = '';
+
+    function loadTileData() {
+        try {
+            const raw = localStorage.getItem(TILE_STORAGE_KEY);
+            if (!raw) return {};
+            return JSON.parse(raw);
+        } catch {
+            return {};
+        }
+    }
+
+    function saveTileData(data) {
+        localStorage.setItem(TILE_STORAGE_KEY, JSON.stringify(data));
+    }
+
+    function getTileModeKey(path) {
+        const cleanPath = path.split('?')[0];
+        return cleanPath.endsWith('/') ? cleanPath : cleanPath + '/';
+    }
+
+    function getTileSizeFromState() {
+        if (typeof HFS !== 'undefined' && HFS.state && HFS.state.tile_size !== undefined) {
+            return HFS.state.tile_size;
+        }
+        return undefined;
+    }
+
+    function setTileSize(value) {
+        if (typeof HFS !== 'undefined' && HFS.state) {
+            tileChanging = true;
+            HFS.state.tile_size = value;
+            tileChanging = false;
+        }
+    }
+
+    function loadTileModeForPath(path) {
+        if (!ENABLE_TILE_MODE_MEMORY) return;
+        if (typeof HFS === 'undefined' || !HFS.state) return;
+
+        const key = getTileModeKey(path);
+        const data = loadTileData();
+        const saved = data[key];
+
+        if (saved !== undefined && saved.size !== undefined) {
+            // 檢查是否過期
+            if (EXPIRE !== Infinity && Date.now() - saved.time > EXPIRE) {
+                // 過期了，刪除記錄
+                delete data[key];
+                saveTileData(data);
+                return;
+            }
+            setTileSize(saved.size);
+        }
+    }
+
+    function saveTileModeForPath(path) {
+        if (!ENABLE_TILE_MODE_MEMORY) return;
+        if (typeof HFS === 'undefined' || !HFS.state) return;
+
+        const key = getTileModeKey(path);
+        const currentSize = getTileSizeFromState();
+        
+        if (currentSize === undefined) return;
+
+        const data = loadTileData();
+        data[key] = {
+            size: currentSize,
+            time: Date.now()
+        };
+        saveTileData(data);
+    }
+
+    function initTileModeModule() {
+        if (!ENABLE_TILE_MODE_MEMORY) return;
+        if (typeof HFS === 'undefined' || !HFS.watchState) return;
+
+        // 監聽 URI 變化
+        HFS.watchState('uri', function(uri) {
+            if (!uri) return;
+            
+            const path = uri.split('?')[0];
+            const key = getTileModeKey(path);
+            
+            if (currentTileUri === key) return;
+            
+            // 保存當前目錄的 tile 設置
+            if (currentTileUri) {
+                saveTileModeForPath(currentTileUri);
+            }
+            
+            currentTileUri = key;
+            
+            // 加載新目錄的 tile 設置
+            loadTileModeForPath(path);
+        });
+
+        // 監聽 tile_size 變化（用戶手動更改時保存）
+        HFS.watchState('tile_size', function(value) {
+            if (!ENABLE_TILE_MODE_MEMORY) return;
+            if (tileChanging) return;
+            if (!currentTileUri) return;
+            
+            // 用戶手動更改，保存當前目錄的設置
+            saveTileModeForPath(currentTileUri);
+        });
+
+        // 初始化時加載當前目錄的 tile 設置
+        const currentUri = HFS.state ? HFS.state.uri : location.pathname;
+        if (currentUri) {
+            const path = currentUri.split('?')[0];
+            currentTileUri = getTileModeKey(path);
+            
+            setTimeout(function() {
+                loadTileModeForPath(path);
+            }, 300);
+        }
+
+        // 頁面卸載時保存當前 tile 設置
+        window.addEventListener('beforeunload', function() {
+            if (currentTileUri) {
+                saveTileModeForPath(currentTileUri);
+            }
+        });
     }
 
     // ============================================================
@@ -718,10 +891,12 @@
     const CombinedPluginAPI = {
         isScrollEnabled: function() { return ENABLE_SCROLL_REMEMBER; },
         isGestureEnabled: function() { return ENABLE_GESTURE_NAVIGATION; },
+        isTileModeEnabled: function() { return ENABLE_TILE_MODE_MEMORY; },
 
         scroll: {
             save: saveScroll,
-            restore: restoreScroll
+            restore: restoreScroll,
+            cleanExpired: forceCleanExpired
         },
 
         gesture: {
@@ -731,6 +906,21 @@
                     document.dispatchEvent(event);
                 }
             }
+        },
+
+        tile: {
+            save: function() {
+                if (ENABLE_TILE_MODE_MEMORY && currentTileUri) {
+                    saveTileModeForPath(currentTileUri);
+                }
+            },
+            load: function(path) {
+                if (ENABLE_TILE_MODE_MEMORY) {
+                    loadTileModeForPath(path || location.pathname);
+                }
+            },
+            getCurrentUri: function() { return currentTileUri; },
+            cleanExpired: forceCleanExpired
         }
     };
 
@@ -739,6 +929,7 @@
     // ============================================================
     function init() {
         initScrollModule();
+        initTileModeModule();
         GestureModule.init();
 
         if (typeof window !== 'undefined') {
