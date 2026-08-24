@@ -1,1 +1,1 @@
-"Remember scroll position for every folder with swipe gesture and Backspace key navigation support."
+Navigation Optimizer: Scroll position memory + Gesture navigation + Tile mode memory for HFS
