@@ -1,4 +1,4 @@
-exports.version = 1.3
+exports.version = 1.4
 exports.apiRequired = 8.87
 exports.repo = "Hug3O/Navigation-Optimizer"
 exports.description = "Navigation Optimizer: Scroll position memory + Gesture navigation + Tile mode memory for HFS"

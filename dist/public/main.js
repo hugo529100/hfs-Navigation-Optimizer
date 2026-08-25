@@ -232,7 +232,7 @@
         animationFrameId = requestAnimationFrame(step);
     }
 
-    // ---- 清理過期記錄（優化版） ----
+    // ---- 清理過期記錄（每個目錄獨立判斷） ----
     function cleanExpired() {
         if (EXPIRE === Infinity) return;
 
@@ -240,7 +240,7 @@
         let scrollChanged = false;
         let tileChanged = false;
 
-        // 清理滾動記錄
+        // 清理滾動記錄 - 每個目錄獨立判斷
         const scrollData = loadData();
         for (const key in scrollData) {
             if (now - scrollData[key].time > EXPIRE) {
@@ -252,7 +252,7 @@
             saveData(scrollData);
         }
 
-        // 清理 Tile 記錄
+        // 清理 Tile 記錄 - 每個目錄獨立判斷
         if (ENABLE_TILE_MODE_MEMORY) {
             const tileData = loadTileData();
             for (const key in tileData) {
@@ -280,7 +280,7 @@
         cleanExpired();
     }
 
-    // ---- 保存滾動位置（防抖優化） ----
+    // ---- 保存滾動位置（每次訪問更新當前目錄時間） ----
     function saveScroll() {
         if (!ENABLE_SCROLL_REMEMBER) return;
         if (isRestoring) return;
@@ -292,7 +292,7 @@
         const data = loadData();
         data[currentPath()] = {
             y: getScrollY(),
-            time: Date.now()
+            time: Date.now()  // 每次訪問都更新當前目錄的時間
         };
         saveData(data);
     }
@@ -389,7 +389,7 @@
                 const scrollData = loadData();
                 let needsClean = false;
                 
-                // 檢查滾動記錄
+                // 檢查滾動記錄 - 每個目錄獨立檢查
                 for (const key in scrollData) {
                     if (now - scrollData[key].time > EXPIRE) {
                         needsClean = true;
@@ -397,7 +397,7 @@
                     }
                 }
                 
-                // 檢查 Tile 記錄
+                // 檢查 Tile 記錄 - 每個目錄獨立檢查
                 if (!needsClean && ENABLE_TILE_MODE_MEMORY) {
                     const tileData = loadTileData();
                     for (const key in tileData) {
@@ -548,6 +548,7 @@
     const TILE_STORAGE_KEY = 'hfs-folder-tile-mode';
     let tileChanging = false;
     let currentTileUri = '';
+    let globalDefaultTileSize = undefined;  // 保存 HFS 全局默認 tile size
 
     function loadTileData() {
         try {
@@ -583,6 +584,20 @@
         }
     }
 
+    // ---- 獲取 HFS 全局默認 tile size ----
+    function getGlobalDefaultTileSize() {
+        if (globalDefaultTileSize !== undefined) {
+            return globalDefaultTileSize;
+        }
+        // 如果還沒有保存，從 HFS.state 讀取當前值作為默認
+        const current = getTileSizeFromState();
+        if (current !== undefined) {
+            globalDefaultTileSize = current;
+            return current;
+        }
+        return 0; // 最終 fallback
+    }
+
     function loadTileModeForPath(path) {
         if (!ENABLE_TILE_MODE_MEMORY) return;
         if (typeof HFS === 'undefined' || !HFS.state) return;
@@ -597,9 +612,23 @@
                 // 過期了，刪除記錄
                 delete data[key];
                 saveTileData(data);
+                // 過期後使用全局默認
+                const defaultSize = getGlobalDefaultTileSize();
+                if (getTileSizeFromState() !== defaultSize) {
+                    setTileSize(defaultSize);
+                }
                 return;
             }
+            // 有有效記錄 -> 恢復用戶保存的設置
             setTileSize(saved.size);
+            return;
+        }
+        
+        // 【核心修改】沒有記錄 -> 恢復到 HFS 全局默認設置（不繼承任何值）
+        const defaultSize = getGlobalDefaultTileSize();
+        const currentSize = getTileSizeFromState();
+        if (currentSize !== defaultSize) {
+            setTileSize(defaultSize);
         }
     }
 
@@ -615,7 +644,7 @@
         const data = loadTileData();
         data[key] = {
             size: currentSize,
-            time: Date.now()
+            time: Date.now()  // 每次保存都更新當前目錄的時間
         };
         saveTileData(data);
     }
@@ -623,6 +652,15 @@
     function initTileModeModule() {
         if (!ENABLE_TILE_MODE_MEMORY) return;
         if (typeof HFS === 'undefined' || !HFS.watchState) return;
+
+        // 初始化時記錄 HFS 全局默認 tile size
+        // 延遲獲取，確保 HFS.state 已經初始化
+        setTimeout(function() {
+            const initialSize = getTileSizeFromState();
+            if (initialSize !== undefined) {
+                globalDefaultTileSize = initialSize;
+            }
+        }, 100);
 
         // 監聽 URI 變化
         HFS.watchState('uri', function(uri) {
@@ -633,14 +671,18 @@
             
             if (currentTileUri === key) return;
             
-            // 保存當前目錄的 tile 設置
+            // 【核心修改】只有當前目錄有記錄時才保存
             if (currentTileUri) {
-                saveTileModeForPath(currentTileUri);
+                const data = loadTileData();
+                if (data[currentTileUri] !== undefined) {
+                    saveTileModeForPath(currentTileUri);
+                }
             }
             
             currentTileUri = key;
             
-            // 加載新目錄的 tile 設置
+            // 加載新目錄的 tile 設置（如果有記錄）
+            // 沒有記錄則恢復到 HFS 全局默認設置，不繼承任何值
             loadTileModeForPath(path);
         });
 
@@ -665,10 +707,13 @@
             }, 300);
         }
 
-        // 頁面卸載時保存當前 tile 設置
+        // 頁面卸載時保存當前 tile 設置（僅當有記錄時）
         window.addEventListener('beforeunload', function() {
             if (currentTileUri) {
-                saveTileModeForPath(currentTileUri);
+                const data = loadTileData();
+                if (data[currentTileUri] !== undefined) {
+                    saveTileModeForPath(currentTileUri);
+                }
             }
         });
     }
