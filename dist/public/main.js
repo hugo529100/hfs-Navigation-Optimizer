@@ -10,13 +10,118 @@
 
     const ENABLE_SCROLL_REMEMBER = config.enableScrollRemember !== false;
     const ENABLE_GESTURE_NAVIGATION = config.enableGestureNavigation !== false;
-    const ENABLE_TILE_MODE_MEMORY = config.enableTileModeMemory !== false;
 
     // 從小時轉換為毫秒
     const EXPIRE_HOURS = config.expireHours ?? 24;
     const EXPIRE = EXPIRE_HOURS === 0
         ? Infinity
         : EXPIRE_HOURS * 60 * 60 * 1000;
+
+    // ============================================================
+    //  Performance Detection Module
+    // ============================================================
+    const PerformanceDetector = {
+        _isLowPerf: null,
+        _tested: false,
+
+        /**
+         * 檢測設備是否為低性能
+         * 使用多種指標綜合判斷
+         */
+        detect: function() {
+            if (this._tested) return this._isLowPerf;
+
+            let lowPerfScore = 0;
+            const totalTests = 5;
+
+            try {
+                // 測試1: CPU 運算速度
+                const start1 = performance.now();
+                let sum = 0;
+                for (let i = 0; i < 50000; i++) {
+                    sum += Math.sqrt(i) * Math.sin(i);
+                }
+                const cpuTime = performance.now() - start1;
+                if (cpuTime > 100) lowPerfScore++;
+                if (cpuTime > 200) lowPerfScore++;
+
+                // 測試2: 記憶體 / 設備類型檢測
+                const isMobile = /Android|iPhone|iPad|iPod|BlackBerry|Windows Phone|Opera Mini|IEMobile/i.test(navigator.userAgent);
+                const isOldBrowser = /MSIE|Trident|Edge\/1[0-9]|Firefox\/[4-5][0-9]|Chrome\/[4-9][0-9]?[0-9]?/i.test(navigator.userAgent);
+                if (isMobile) lowPerfScore++;
+                if (isOldBrowser) lowPerfScore++;
+
+                // 測試3: 硬體並行性
+                const cores = navigator.hardwareConcurrency || 1;
+                if (cores <= 2) lowPerfScore++;
+
+                // 測試4: 記憶體限制
+                if (navigator.deviceMemory && navigator.deviceMemory < 4) lowPerfScore++;
+
+                // 測試5: 幀率測試 (簡單版)
+                let frameTime = 0;
+                const start2 = performance.now();
+                requestAnimationFrame(function(timestamp) {
+                    frameTime = timestamp - start2;
+                    if (frameTime > 20) lowPerfScore++;
+                });
+                // 同步等待一幀
+                const syncStart = performance.now();
+                while (performance.now() - syncStart < 20) {
+                    // 等待
+                }
+                // 如果上面的 requestAnimationFrame 還沒執行，用同步方式檢測
+                if (frameTime === 0) {
+                    // 用 setTimeout 檢測
+                    const checkStart = performance.now();
+                    setTimeout(function() {
+                        const elapsed = performance.now() - checkStart;
+                        if (elapsed > 30) lowPerfScore++;
+                    }, 0);
+                }
+
+            } catch (e) {
+                // 檢測失敗，保守判斷為低性能
+                lowPerfScore = 3;
+            }
+
+            // 如果分數超過總測試的一半，判定為低性能
+            this._isLowPerf = lowPerfScore >= (totalTests / 2);
+            this._tested = true;
+
+            return this._isLowPerf;
+        },
+
+        /**
+         * 獲取檢測結果（快取）
+         */
+        isLowPerformance: function() {
+            if (!this._tested) {
+                this.detect();
+            }
+            return this._isLowPerf;
+        },
+
+        /**
+         * 重置檢測（用於重新測試）
+         */
+        reset: function() {
+            this._isLowPerf = null;
+            this._tested = false;
+        }
+    };
+
+    // ============================================================
+    //  Performance-based Configuration
+    // ============================================================
+    const IS_LOW_PERFORMANCE = PerformanceDetector.isLowPerformance();
+
+    // 根據性能調整配置
+    const ENABLE_SMOOTH_SCROLL = config.enableSmoothScroll !== false && !IS_LOW_PERFORMANCE;
+    const SCROLL_DURATION = IS_LOW_PERFORMANCE ? 200 : 800;
+    const RESTORE_DELAY = IS_LOW_PERFORMANCE ? 30 : 80;
+    const URI_WATCH_INTERVAL = IS_LOW_PERFORMANCE ? 500 : 200;
+    const MAX_ANIMATION_FRAMES = IS_LOW_PERFORMANCE ? 30 : 120;
 
     // ============================================================
     //  Gesture Navigation Settings (Hardcoded)
@@ -35,9 +140,6 @@
     // ============================================================
     //  Scroll Position Memory Module
     // ============================================================
-    const RESTORE_DELAY = 80;
-    const URI_WATCH_INTERVAL = 200;
-
     const STORAGE_KEY = "hfs-folder-scroll";
     const META_KEY = "hfs-folder-scroll-meta";
 
@@ -146,10 +248,25 @@
         }
     }
 
-    // ---- 平滑滾動（優化版） ----
+    // ---- 平滑滾動（優化版，支援低性能設備） ----
     function smoothSetScrollY(targetY) {
         updateDialogState();
         if (isDialogOpen) return;
+
+        // 低性能設備或平滑滾動被禁用時，直接跳轉
+        if (!ENABLE_SMOOTH_SCROLL) {
+            window.scrollTo({ top: targetY, behavior: "instant" });
+            return;
+        }
+
+        // 防止重入
+        if (isAnimating) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+            isAnimating = false;
+            window.scrollTo({ top: targetY, behavior: "instant" });
+            return;
+        }
 
         if (animationFrameId) {
             cancelAnimationFrame(animationFrameId);
@@ -157,42 +274,32 @@
             isAnimating = false;
         }
 
-        const startY = window.pageYOffset
-            || document.documentElement.scrollTop
-            || document.body.scrollTop
-            || 0;
-
+        const startY = getScrollY();
         const distance = targetY - startY;
         const MIN_DISTANCE = 10;
 
         if (Math.abs(distance) < MIN_DISTANCE) {
             window.scrollTo({ top: targetY, behavior: "instant" });
-            if (document.documentElement) {
-                document.documentElement.scrollTop = targetY;
-            }
-            if (document.body) {
-                document.body.scrollTop = targetY;
-            }
             return;
         }
 
-        const DURATION = 800;
-        const EASING = 'easeOutQuart';
-
+        const DURATION = SCROLL_DURATION;
         const startTime = performance.now();
         isAnimating = true;
 
-        const easingMap = {
-            easeOutQuad: function(t) { return 1 - Math.pow(1 - t, 2); },
-            easeOutCubic: function(t) { return 1 - Math.pow(1 - t, 3); },
-            easeOutQuart: function(t) { return 1 - Math.pow(1 - t, 4); },
-            easeOutQuint: function(t) { return 1 - Math.pow(1 - t, 5); }
-        };
-
-        const easingFn = easingMap[EASING] || easingMap.easeOutQuart;
+        let frameCount = 0;
+        const MAX_FRAMES = MAX_ANIMATION_FRAMES;
 
         function step(currentTime) {
-            if (!isAnimating) return;
+            frameCount++;
+            
+            // 強制終止條件
+            if (!isAnimating || frameCount > MAX_FRAMES) {
+                isAnimating = false;
+                animationFrameId = null;
+                window.scrollTo({ top: targetY, behavior: "instant" });
+                return;
+            }
             
             updateDialogState();
             if (isDialogOpen) {
@@ -203,16 +310,11 @@
 
             const elapsed = currentTime - startTime;
             const progress = Math.min(elapsed / DURATION, 1);
-            const easedProgress = easingFn(progress);
+            // 使用簡單的 easeOutQuad 緩動
+            const easedProgress = 1 - Math.pow(1 - progress, 2);
 
             const currentY = startY + distance * easedProgress;
             window.scrollTo({ top: currentY, behavior: "instant" });
-            if (document.documentElement) {
-                document.documentElement.scrollTop = currentY;
-            }
-            if (document.body) {
-                document.body.scrollTop = currentY;
-            }
 
             if (progress < 1 && isAnimating) {
                 animationFrameId = requestAnimationFrame(step);
@@ -220,27 +322,20 @@
                 isAnimating = false;
                 animationFrameId = null;
                 window.scrollTo({ top: targetY, behavior: "instant" });
-                if (document.documentElement) {
-                    document.documentElement.scrollTop = targetY;
-                }
-                if (document.body) {
-                    document.body.scrollTop = targetY;
-                }
             }
         }
 
         animationFrameId = requestAnimationFrame(step);
     }
 
-    // ---- 清理過期記錄（每個目錄獨立判斷） ----
+    // ---- 清理過期記錄 ----
     function cleanExpired() {
         if (EXPIRE === Infinity) return;
 
         const now = Date.now();
         let scrollChanged = false;
-        let tileChanged = false;
 
-        // 清理滾動記錄 - 每個目錄獨立判斷
+        // 清理滾動記錄
         const scrollData = loadData();
         for (const key in scrollData) {
             if (now - scrollData[key].time > EXPIRE) {
@@ -250,20 +345,6 @@
         }
         if (scrollChanged) {
             saveData(scrollData);
-        }
-
-        // 清理 Tile 記錄 - 每個目錄獨立判斷
-        if (ENABLE_TILE_MODE_MEMORY) {
-            const tileData = loadTileData();
-            for (const key in tileData) {
-                if (now - tileData[key].time > EXPIRE) {
-                    delete tileData[key];
-                    tileChanged = true;
-                }
-            }
-            if (tileChanged) {
-                saveTileData(tileData);
-            }
         }
 
         // 更新清理時間標記（只記錄日期）
@@ -292,7 +373,7 @@
         const data = loadData();
         data[currentPath()] = {
             y: getScrollY(),
-            time: Date.now()  // 每次訪問都更新當前目錄的時間
+            time: Date.now()
         };
         saveData(data);
     }
@@ -308,7 +389,7 @@
         }, 500);
     }
 
-    // ---- 恢復滾動位置 ----
+    // ---- 恢復滾動位置（優化版） ----
     function restoreScroll() {
         if (!ENABLE_SCROLL_REMEMBER) return;
         if (isRestoring) return;
@@ -316,12 +397,10 @@
         updateDialogState();
         if (isDialogOpen) return;
 
-        const path = currentPath();
+        // 取消所有待執行的恢復
+        cancelAllPendingRestores();
 
-        if (restoreTimer) {
-            clearTimeout(restoreTimer);
-            restoreTimer = null;
-        }
+        const path = currentPath();
 
         // 每次恢復前都清理過期記錄
         cleanExpired();
@@ -337,27 +416,37 @@
 
         isRestoring = true;
 
-        restoreTimer = setTimeout(function() {
-            restoreTimer = null;
+        // 先立即跳轉到目標位置（防止閃爍）
+        window.scrollTo({ top: targetY, behavior: "instant" });
 
-            if (currentPath() !== path) {
-                isRestoring = false;
-                return;
-            }
+        // 延遲執行平滑滾動（如果啟用）
+        if (ENABLE_SMOOTH_SCROLL) {
+            restoreTimer = setTimeout(function() {
+                restoreTimer = null;
 
-            updateDialogState();
-            if (isDialogOpen) {
-                isRestoring = false;
-                return;
-            }
+                if (currentPath() !== path) {
+                    isRestoring = false;
+                    return;
+                }
 
-            smoothSetScrollY(targetY);
+                updateDialogState();
+                if (isDialogOpen) {
+                    isRestoring = false;
+                    return;
+                }
 
-            setTimeout(function() {
-                isRestoring = false;
-            }, 300);
-        }, RESTORE_DELAY);
+                smoothSetScrollY(targetY);
 
+                setTimeout(function() {
+                    isRestoring = false;
+                }, 300);
+            }, RESTORE_DELAY);
+        } else {
+            // 低性能設備：直接跳轉，不等待動畫
+            isRestoring = false;
+        }
+
+        // 超時保護
         setTimeout(function() {
             if (isRestoring) {
                 isRestoring = false;
@@ -365,8 +454,14 @@
                     clearTimeout(restoreTimer);
                     restoreTimer = null;
                 }
+                // 確保最終位置正確
+                const data = loadData();
+                const info = data[path];
+                if (info && typeof info.y === 'number') {
+                    window.scrollTo({ top: Math.max(0, info.y), behavior: "instant" });
+                }
             }
-        }, 3000);
+        }, 2000);
     }
 
     // ---- 每日清理器（放緩檢查頻率） ----
@@ -389,22 +484,11 @@
                 const scrollData = loadData();
                 let needsClean = false;
                 
-                // 檢查滾動記錄 - 每個目錄獨立檢查
+                // 檢查滾動記錄
                 for (const key in scrollData) {
                     if (now - scrollData[key].time > EXPIRE) {
                         needsClean = true;
                         break;
-                    }
-                }
-                
-                // 檢查 Tile 記錄 - 每個目錄獨立檢查
-                if (!needsClean && ENABLE_TILE_MODE_MEMORY) {
-                    const tileData = loadTileData();
-                    for (const key in tileData) {
-                        if (now - tileData[key].time > EXPIRE) {
-                            needsClean = true;
-                            break;
-                        }
                     }
                 }
                 
@@ -415,17 +499,24 @@
         }, 1800000); // 30分鐘檢查一次
     }
 
-    // ---- 滾動監聽（優化版） ----
+    // ---- 滾動監聽（優化版，支援低性能設備） ----
     function installScrollListener() {
         if (!ENABLE_SCROLL_REMEMBER) return;
 
         let ticking = false;
+        let lastScrollSaveTime = 0;
+        const MIN_SAVE_INTERVAL = IS_LOW_PERFORMANCE ? 200 : 100;
 
         window.addEventListener('scroll', function() {
             updateDialogState();
             if (isDialogOpen) return;
             if (isRestoring) return;
             if (isAnimating) return;
+
+            // 時間節流
+            const now = Date.now();
+            if (now - lastScrollSaveTime < MIN_SAVE_INTERVAL) return;
+            lastScrollSaveTime = now;
 
             if (!ticking) {
                 window.requestAnimationFrame(function() {
@@ -459,7 +550,7 @@
 
         window.addEventListener("popstate", function() {
             cancelAllPendingRestores();
-            scheduleRestore(100);
+            scheduleRestore(RESTORE_DELAY + 20);
         });
     }
 
@@ -478,7 +569,7 @@
                 isProcessing = true;
                 last = now;
                 cancelAllPendingRestores();
-                scheduleRestore(120);
+                scheduleRestore(RESTORE_DELAY + 40);
                 isProcessing = false;
             }
         }, URI_WATCH_INTERVAL);
@@ -494,14 +585,14 @@
         document.addEventListener("visibilitychange", function() {
             if (!document.hidden) {
                 cancelAllPendingRestores();
-                scheduleRestore(200);
+                scheduleRestore(RESTORE_DELAY + 120);
             }
         });
 
         window.addEventListener("pageshow", function(e) {
             if (e.persisted) {
                 cancelAllPendingRestores();
-                scheduleRestore(150);
+                scheduleRestore(RESTORE_DELAY + 70);
             }
         });
 
@@ -519,12 +610,12 @@
 
         if (document.readyState === 'complete') {
             setTimeout(function() {
-                scheduleRestore(500);
+                scheduleRestore(RESTORE_DELAY + 420);
             }, 100);
         } else {
             window.addEventListener('load', function() {
                 setTimeout(function() {
-                    scheduleRestore(400);
+                    scheduleRestore(RESTORE_DELAY + 320);
                 }, 100);
             });
         }
@@ -539,183 +630,7 @@
     function restoreForGesture() {
         if (!ENABLE_SCROLL_REMEMBER) return;
         cancelAllPendingRestores();
-        scheduleRestore(300);
-    }
-
-    // ============================================================
-    //  Tile Mode Memory Module
-    // ============================================================
-    const TILE_STORAGE_KEY = 'hfs-folder-tile-mode';
-    let tileChanging = false;
-    let currentTileUri = '';
-    let globalDefaultTileSize = undefined;  // 保存 HFS 全局默認 tile size
-
-    function loadTileData() {
-        try {
-            const raw = localStorage.getItem(TILE_STORAGE_KEY);
-            if (!raw) return {};
-            return JSON.parse(raw);
-        } catch {
-            return {};
-        }
-    }
-
-    function saveTileData(data) {
-        localStorage.setItem(TILE_STORAGE_KEY, JSON.stringify(data));
-    }
-
-    function getTileModeKey(path) {
-        const cleanPath = path.split('?')[0];
-        return cleanPath.endsWith('/') ? cleanPath : cleanPath + '/';
-    }
-
-    function getTileSizeFromState() {
-        if (typeof HFS !== 'undefined' && HFS.state && HFS.state.tile_size !== undefined) {
-            return HFS.state.tile_size;
-        }
-        return undefined;
-    }
-
-    function setTileSize(value) {
-        if (typeof HFS !== 'undefined' && HFS.state) {
-            tileChanging = true;
-            HFS.state.tile_size = value;
-            tileChanging = false;
-        }
-    }
-
-    // ---- 獲取 HFS 全局默認 tile size ----
-    function getGlobalDefaultTileSize() {
-        if (globalDefaultTileSize !== undefined) {
-            return globalDefaultTileSize;
-        }
-        // 如果還沒有保存，從 HFS.state 讀取當前值作為默認
-        const current = getTileSizeFromState();
-        if (current !== undefined) {
-            globalDefaultTileSize = current;
-            return current;
-        }
-        return 0; // 最終 fallback
-    }
-
-    function loadTileModeForPath(path) {
-        if (!ENABLE_TILE_MODE_MEMORY) return;
-        if (typeof HFS === 'undefined' || !HFS.state) return;
-
-        const key = getTileModeKey(path);
-        const data = loadTileData();
-        const saved = data[key];
-
-        if (saved !== undefined && saved.size !== undefined) {
-            // 檢查是否過期
-            if (EXPIRE !== Infinity && Date.now() - saved.time > EXPIRE) {
-                // 過期了，刪除記錄
-                delete data[key];
-                saveTileData(data);
-                // 過期後使用全局默認
-                const defaultSize = getGlobalDefaultTileSize();
-                if (getTileSizeFromState() !== defaultSize) {
-                    setTileSize(defaultSize);
-                }
-                return;
-            }
-            // 有有效記錄 -> 恢復用戶保存的設置
-            setTileSize(saved.size);
-            return;
-        }
-        
-        // 【核心修改】沒有記錄 -> 恢復到 HFS 全局默認設置（不繼承任何值）
-        const defaultSize = getGlobalDefaultTileSize();
-        const currentSize = getTileSizeFromState();
-        if (currentSize !== defaultSize) {
-            setTileSize(defaultSize);
-        }
-    }
-
-    function saveTileModeForPath(path) {
-        if (!ENABLE_TILE_MODE_MEMORY) return;
-        if (typeof HFS === 'undefined' || !HFS.state) return;
-
-        const key = getTileModeKey(path);
-        const currentSize = getTileSizeFromState();
-        
-        if (currentSize === undefined) return;
-
-        const data = loadTileData();
-        data[key] = {
-            size: currentSize,
-            time: Date.now()  // 每次保存都更新當前目錄的時間
-        };
-        saveTileData(data);
-    }
-
-    function initTileModeModule() {
-        if (!ENABLE_TILE_MODE_MEMORY) return;
-        if (typeof HFS === 'undefined' || !HFS.watchState) return;
-
-        // 初始化時記錄 HFS 全局默認 tile size
-        // 延遲獲取，確保 HFS.state 已經初始化
-        setTimeout(function() {
-            const initialSize = getTileSizeFromState();
-            if (initialSize !== undefined) {
-                globalDefaultTileSize = initialSize;
-            }
-        }, 100);
-
-        // 監聽 URI 變化
-        HFS.watchState('uri', function(uri) {
-            if (!uri) return;
-            
-            const path = uri.split('?')[0];
-            const key = getTileModeKey(path);
-            
-            if (currentTileUri === key) return;
-            
-            // 【核心修改】只有當前目錄有記錄時才保存
-            if (currentTileUri) {
-                const data = loadTileData();
-                if (data[currentTileUri] !== undefined) {
-                    saveTileModeForPath(currentTileUri);
-                }
-            }
-            
-            currentTileUri = key;
-            
-            // 加載新目錄的 tile 設置（如果有記錄）
-            // 沒有記錄則恢復到 HFS 全局默認設置，不繼承任何值
-            loadTileModeForPath(path);
-        });
-
-        // 監聽 tile_size 變化（用戶手動更改時保存）
-        HFS.watchState('tile_size', function(value) {
-            if (!ENABLE_TILE_MODE_MEMORY) return;
-            if (tileChanging) return;
-            if (!currentTileUri) return;
-            
-            // 用戶手動更改，保存當前目錄的設置
-            saveTileModeForPath(currentTileUri);
-        });
-
-        // 初始化時加載當前目錄的 tile 設置
-        const currentUri = HFS.state ? HFS.state.uri : location.pathname;
-        if (currentUri) {
-            const path = currentUri.split('?')[0];
-            currentTileUri = getTileModeKey(path);
-            
-            setTimeout(function() {
-                loadTileModeForPath(path);
-            }, 300);
-        }
-
-        // 頁面卸載時保存當前 tile 設置（僅當有記錄時）
-        window.addEventListener('beforeunload', function() {
-            if (currentTileUri) {
-                const data = loadTileData();
-                if (data[currentTileUri] !== undefined) {
-                    saveTileModeForPath(currentTileUri);
-                }
-            }
-        });
+        scheduleRestore(RESTORE_DELAY + 220);
     }
 
     // ============================================================
@@ -936,7 +851,7 @@
     const CombinedPluginAPI = {
         isScrollEnabled: function() { return ENABLE_SCROLL_REMEMBER; },
         isGestureEnabled: function() { return ENABLE_GESTURE_NAVIGATION; },
-        isTileModeEnabled: function() { return ENABLE_TILE_MODE_MEMORY; },
+        isLowPerformance: function() { return IS_LOW_PERFORMANCE; },
 
         scroll: {
             save: saveScroll,
@@ -953,19 +868,10 @@
             }
         },
 
-        tile: {
-            save: function() {
-                if (ENABLE_TILE_MODE_MEMORY && currentTileUri) {
-                    saveTileModeForPath(currentTileUri);
-                }
-            },
-            load: function(path) {
-                if (ENABLE_TILE_MODE_MEMORY) {
-                    loadTileModeForPath(path || location.pathname);
-                }
-            },
-            getCurrentUri: function() { return currentTileUri; },
-            cleanExpired: forceCleanExpired
+        performance: {
+            detect: PerformanceDetector.detect.bind(PerformanceDetector),
+            isLowPerformance: PerformanceDetector.isLowPerformance.bind(PerformanceDetector),
+            reset: PerformanceDetector.reset.bind(PerformanceDetector)
         }
     };
 
@@ -974,11 +880,17 @@
     // ============================================================
     function init() {
         initScrollModule();
-        initTileModeModule();
         GestureModule.init();
 
         if (typeof window !== 'undefined') {
             window.__CombinedPlugin = CombinedPluginAPI;
+        }
+
+        // 在控制台輸出性能狀態（便於調試）
+        if (IS_LOW_PERFORMANCE) {
+            console.log('[Plugin] 低性能模式已啟用，平滑滾動已禁用');
+        } else {
+            console.log('[Plugin] 高性能模式，平滑滾動已啟用');
         }
     }
 
