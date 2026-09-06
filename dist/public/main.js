@@ -142,6 +142,7 @@
     // ============================================================
     const STORAGE_KEY = "hfs-folder-scroll";
     const META_KEY = "hfs-folder-scroll-meta";
+    const MIN_ENTRIES_TO_SAVE = 9; // 最少条目数，少于这个值不保存滚动位置
 
     // ---- 狀態管理 ----
     let isRestoring = false;
@@ -197,6 +198,37 @@
             || document.documentElement.scrollTop
             || document.body.scrollTop
             || 0;
+    }
+
+    // ---- 获取页面条目数量 ----
+    function getEntryCount() {
+        // 尝试多种选择器以兼容不同版本的HFS
+        const selectors = [
+            '.dir li',
+            '.list li',
+            '#files-list li',
+            '[role="list"] li',
+            '[role="listitem"]',
+            '.entry'
+        ];
+        
+        for (const selector of selectors) {
+            const items = document.querySelectorAll(selector);
+            if (items.length > 0) {
+                return items.length;
+            }
+        }
+        
+        // 如果找不到条目容器，尝试从文件列表容器中统计
+        const containers = document.querySelectorAll('.dir, .list, #files-list, [role="list"]');
+        for (const container of containers) {
+            const items = container.querySelectorAll('li, .entry, [role="listitem"]');
+            if (items.length > 0) {
+                return items.length;
+            }
+        }
+        
+        return 0;
     }
 
     // ---- 取消所有待執行的恢復 ----
@@ -369,6 +401,12 @@
         
         updateDialogState();
         if (isDialogOpen) return;
+
+        // 檢查條目數量，少於 MIN_ENTRIES_TO_SAVE 個不保存
+        const entryCount = getEntryCount();
+        if (entryCount > 0 && entryCount < MIN_ENTRIES_TO_SAVE) {
+            return;
+        }
 
         const data = loadData();
         data[currentPath()] = {
@@ -884,13 +922,6 @@
 
         if (typeof window !== 'undefined') {
             window.__CombinedPlugin = CombinedPluginAPI;
-        }
-
-        // 在控制台輸出性能狀態（便於調試）
-        if (IS_LOW_PERFORMANCE) {
-            console.log('[Plugin] 低性能模式已啟用，平滑滾動已禁用');
-        } else {
-            console.log('[Plugin] 高性能模式，平滑滾動已啟用');
         }
     }
 
