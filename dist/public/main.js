@@ -200,9 +200,9 @@
             || 0;
     }
 
-    // ---- 获取页面条目数量 ----
+    // ---- 獲取頁面條目數量 ----
     function getEntryCount() {
-        // 尝试多种选择器以兼容不同版本的HFS
+        // 嘗試多種選擇器以兼容不同版本的HFS
         const selectors = [
             '.dir li',
             '.list li',
@@ -219,7 +219,7 @@
             }
         }
         
-        // 如果找不到条目容器，尝试从文件列表容器中统计
+        // 如果找不到條目容器，嘗試從文件列表容器中統計
         const containers = document.querySelectorAll('.dir, .list, #files-list, [role="list"]');
         for (const container of containers) {
             const items = container.querySelectorAll('li, .entry, [role="listitem"]');
@@ -229,6 +229,12 @@
         }
         
         return 0;
+    }
+
+    // ---- 檢查是否應該跳過（條目數量太少） ----
+    function shouldSkipDueToFewEntries() {
+        const entryCount = getEntryCount();
+        return entryCount > 0 && entryCount < MIN_ENTRIES_TO_SAVE;
     }
 
     // ---- 取消所有待執行的恢復 ----
@@ -254,6 +260,11 @@
 
     // ---- 安全的 setTimeout（可追蹤） ----
     function scheduleRestore(delay) {
+        // 檢查條目數量，少於 MIN_ENTRIES_TO_SAVE 個不排程恢復
+        if (shouldSkipDueToFewEntries()) {
+            return null;
+        }
+
         if (isRestoring) {
             cancelAllPendingRestores();
         }
@@ -284,6 +295,11 @@
     function smoothSetScrollY(targetY) {
         updateDialogState();
         if (isDialogOpen) return;
+
+        // 檢查條目數量，少於 MIN_ENTRIES_TO_SAVE 個不做任何動作
+        if (shouldSkipDueToFewEntries()) {
+            return;
+        }
 
         // 低性能設備或平滑滾動被禁用時，直接跳轉
         if (!ENABLE_SMOOTH_SCROLL) {
@@ -403,8 +419,7 @@
         if (isDialogOpen) return;
 
         // 檢查條目數量，少於 MIN_ENTRIES_TO_SAVE 個不保存
-        const entryCount = getEntryCount();
-        if (entryCount > 0 && entryCount < MIN_ENTRIES_TO_SAVE) {
+        if (shouldSkipDueToFewEntries()) {
             return;
         }
 
@@ -437,6 +452,11 @@
 
         // 取消所有待執行的恢復
         cancelAllPendingRestores();
+
+        // 檢查條目數量，少於 MIN_ENTRIES_TO_SAVE 個不恢復
+        if (shouldSkipDueToFewEntries()) {
+            return;
+        }
 
         const path = currentPath();
 
