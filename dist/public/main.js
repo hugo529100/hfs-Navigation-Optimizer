@@ -780,6 +780,37 @@
             restoreForGesture();
         }
 
+        /**
+         * 嘗試關閉當前打開的對話框 / file-show。
+         * 只依賴固定結構類名，與界面語言無關。
+         * @returns {boolean} 偵測到對話框並處理則返回 true。
+         */
+        function tryCloseOpenDialog() {
+            // 固定框架類名判斷（語言無關）
+            const modal = document.querySelector(
+                '.dialog-backdrop.file-show, .dialog-backdrop, .modal.in, .v-dialog'
+            );
+            if (!modal) return false;
+
+            // 可見性判斷（語言無關）
+            if (modal.offsetParent === null &&
+                getComputedStyle(modal).display === 'none') {
+                return false;
+            }
+
+            // 固定圖標 / 結構類名找關閉鈕，找不到就點 backdrop（語言無關）
+            const closeBtn =
+                modal.querySelector('.dialog-closer') ||
+                modal.querySelector('.fa-cancel')?.closest('button') ||
+                modal.querySelector('.fa-times')?.closest('button') ||
+                modal.querySelector('button.icon-button:last-of-type');
+
+            (closeBtn || modal).click();
+
+            // 對話框存在即視為已處理，杜絕 fallthrough 到返回上一層
+            return true;
+        }
+
         function triggerParentNavigation() {
             const now = Date.now();
             if (now - lastActionTime < GESTURE_CONFIG.COOLDOWN) return;
@@ -787,22 +818,15 @@
 
             const activeElement = document.activeElement;
             const isContentEditable = activeElement && activeElement.isContentEditable;
-            const inputTypes = ['INPUT', 'TEXTAREA', 'SELECT'];
-            const isInputField = activeElement && inputTypes.includes(activeElement.tagName);
+            const isInputField = activeElement &&
+                ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName);
 
-            if (isContentEditable || isInputField) {
-                return;
-            }
+            if (isContentEditable || isInputField) return;
 
-            const modal = document.querySelector('.dialog-backdrop.file-show, .modal.in, .v-dialog');
-            if (modal) {
-                const closeBtn = modal.querySelector('button[title="Close"], [aria-label="Close"], .close-button');
-                if (closeBtn) {
-                    closeBtn.click();
-                    return;
-                }
-            }
+            // 有對話框 → 只關閉，直接結束（不返回上一層）
+            if (tryCloseOpenDialog()) return;
 
+            // 無對話框 → 才返回上一層
             navigateToParent();
         }
 
@@ -845,8 +869,8 @@
 
             const activeElement = document.activeElement;
             const isContentEditable = activeElement && activeElement.isContentEditable;
-            const inputTypes = ['INPUT', 'TEXTAREA', 'SELECT'];
-            const isInputField = activeElement && inputTypes.includes(activeElement.tagName);
+            const isInputField = activeElement &&
+                ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName);
 
             if (e.keyCode === 8 && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
                 if (!isContentEditable && !isInputField) {
