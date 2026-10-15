@@ -697,6 +697,7 @@
     const GestureModule = (function() {
         let lastActionTime = 0;
         let startPoint = null;
+        let isMultiTouch = false; // 標記是否為多指觸摸
 
         function getCurrentPath() {
             let path = location.pathname;
@@ -831,7 +832,16 @@
         }
 
         function handleTouchStart(e) {
+            // 多指觸摸（如雙指縮放）→ 標記並放棄單指滑動判斷
+            if (e.touches.length > 1) {
+                isMultiTouch = true;
+                startPoint = null;
+                return;
+            }
+
+            // 單指觸摸
             if (e.touches.length === 1) {
+                isMultiTouch = false;
                 startPoint = {
                     x: e.touches[0].clientX,
                     y: e.touches[0].clientY,
@@ -841,6 +851,15 @@
         }
 
         function handleTouchEnd(e) {
+            // 多指觸摸結束 → 重置狀態，不觸發手勢
+            if (isMultiTouch) {
+                if (e.touches.length === 0) {
+                    isMultiTouch = false;
+                }
+                startPoint = null;
+                return;
+            }
+
             if (!startPoint || e.changedTouches.length !== 1) return;
 
             const endPoint = {
@@ -861,6 +880,12 @@
                 triggerParentNavigation();
             }
 
+            startPoint = null;
+        }
+
+        function handleTouchCancel() {
+            // 觸摸被系統取消（如來電、手勢衝突）→ 重置所有狀態
+            isMultiTouch = false;
             startPoint = null;
         }
 
@@ -911,6 +936,7 @@
             try {
                 document.addEventListener('touchstart', handleTouchStart, { passive: true });
                 document.addEventListener('touchend', handleTouchEnd, { passive: true });
+                document.addEventListener('touchcancel', handleTouchCancel, { passive: true });
 
                 if (GESTURE_CONFIG.BACKSPACE_ENABLED) {
                     document.addEventListener('keydown', handleKeyDown, true);
