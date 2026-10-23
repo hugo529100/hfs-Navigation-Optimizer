@@ -18,6 +18,82 @@
         : EXPIRE_HOURS * 60 * 60 * 1000;
 
     // ============================================================
+    //  Options 界面：滾動記憶前端開關（默認開啟）
+    // ============================================================
+    const STORAGE_KEY_SCROLL_UI = 'hfs_scroll_remember_ui_enabled';
+    const TOGGLE_ID = 'scroll-remember-toggle';
+
+    function isLocalStorageSupported() {
+        try {
+            localStorage.setItem('__t', '1');
+            localStorage.removeItem('__t');
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function getScrollUiEnabled() {
+        if (!isLocalStorageSupported()) return true;
+        const val = localStorage.getItem(STORAGE_KEY_SCROLL_UI);
+        return val === null ? true : val === 'true';   // 默認開啟
+    }
+
+    function setScrollUiEnabled(value) {
+        if (isLocalStorageSupported()) {
+            localStorage.setItem(STORAGE_KEY_SCROLL_UI, value ? 'true' : 'false');
+        }
+    }
+
+    // 綜合判斷：服務器配置啟用 且 前端開關開啟
+    function isScrollRememberActive() {
+        return ENABLE_SCROLL_REMEMBER && getScrollUiEnabled();
+    }
+
+    // 向 Options 對話框注入開關
+    function insertScrollToggle() {
+        const optionsDialog = document.querySelector('.dialog[aria-modal="true"]');
+        if (!optionsDialog || document.getElementById(TOGGLE_ID)) return;
+
+        const themeSelect = document.getElementById('option-theme');
+        if (!themeSelect) return;
+
+        const toggleHTML = `
+          <div id="${TOGGLE_ID}" style="display:block;margin-top:1em">
+            <label style="display:block;cursor:pointer">
+              <input type="checkbox" id="scroll-remember-checkbox">
+              Remember Scroll Position
+            </label>
+          </div>
+        `;
+        themeSelect.insertAdjacentHTML('afterend', toggleHTML);
+
+        const checkbox = document.getElementById('scroll-remember-checkbox');
+        checkbox.checked = getScrollUiEnabled();
+        checkbox.addEventListener('change', (e) => {
+            setScrollUiEnabled(e.target.checked);
+            if (typeof HFS.reloadList === 'function') HFS.reloadList();
+        });
+    }
+
+    // 監聽 Options 對話框出現
+    function initOptionsObserver() {
+        const observer = new MutationObserver(() => {
+            const title = document.querySelector('.dialog-title')?.textContent || '';
+            if (title.includes('Options')) {
+                setTimeout(insertScrollToggle, 100);
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => setTimeout(initOptionsObserver, 500));
+    } else {
+        setTimeout(initOptionsObserver, 500);
+    }
+
+    // ============================================================
     //  Performance Detection Module
     // ============================================================
     const PerformanceDetector = {
@@ -411,7 +487,7 @@
 
     // ---- 保存滾動位置（每次訪問更新當前目錄時間） ----
     function saveScroll() {
-        if (!ENABLE_SCROLL_REMEMBER) return;
+        if (!isScrollRememberActive()) return;
         if (isRestoring) return;
         if (isAnimating) return;
         
@@ -444,7 +520,7 @@
 
     // ---- 恢復滾動位置（優化版） ----
     function restoreScroll() {
-        if (!ENABLE_SCROLL_REMEMBER) return;
+        if (!isScrollRememberActive()) return;
         if (isRestoring) return;
         
         updateDialogState();
@@ -559,13 +635,14 @@
 
     // ---- 滾動監聽（優化版，支援低性能設備） ----
     function installScrollListener() {
-        if (!ENABLE_SCROLL_REMEMBER) return;
+        if (!isScrollRememberActive()) return;
 
         let ticking = false;
         let lastScrollSaveTime = 0;
         const MIN_SAVE_INTERVAL = IS_LOW_PERFORMANCE ? 200 : 100;
 
         window.addEventListener('scroll', function() {
+            if (!isScrollRememberActive()) return;
             updateDialogState();
             if (isDialogOpen) return;
             if (isRestoring) return;
@@ -588,9 +665,11 @@
 
     // ---- 事件監聽 ----
     function installFolderClickListener() {
-        if (!ENABLE_SCROLL_REMEMBER) return;
+        if (!isScrollRememberActive()) return;
 
         document.addEventListener("click", function(e) {
+            if (!isScrollRememberActive()) return;
+
             const a = e.target.closest("a");
             if (!a) return;
 
@@ -604,21 +683,23 @@
     }
 
     function installBackForwardListener() {
-        if (!ENABLE_SCROLL_REMEMBER) return;
+        if (!isScrollRememberActive()) return;
 
         window.addEventListener("popstate", function() {
+            if (!isScrollRememberActive()) return;
             cancelAllPendingRestores();
             scheduleRestore(RESTORE_DELAY + 20);
         });
     }
 
     function installUriWatcher() {
-        if (!ENABLE_SCROLL_REMEMBER) return;
+        if (!isScrollRememberActive()) return;
 
         let last = currentPath();
         let isProcessing = false;
 
         setInterval(function() {
+            if (!isScrollRememberActive()) return;
             if (isProcessing) return;
             
             const now = currentPath();
@@ -635,12 +716,13 @@
 
     // ---- 初始化 ----
     function initScrollModule() {
-        if (!ENABLE_SCROLL_REMEMBER) return;
+        if (!isScrollRememberActive()) return;
 
         installDailyCleaner();
         installScrollListener();
 
         document.addEventListener("visibilitychange", function() {
+            if (!isScrollRememberActive()) return;
             if (!document.hidden) {
                 cancelAllPendingRestores();
                 scheduleRestore(RESTORE_DELAY + 120);
@@ -648,6 +730,7 @@
         });
 
         window.addEventListener("pageshow", function(e) {
+            if (!isScrollRememberActive()) return;
             if (e.persisted) {
                 cancelAllPendingRestores();
                 scheduleRestore(RESTORE_DELAY + 70);
@@ -655,10 +738,12 @@
         });
 
         window.addEventListener("beforeunload", function() {
+            if (!isScrollRememberActive()) return;
             saveScroll();
         });
 
         window.addEventListener("pagehide", function() {
+            if (!isScrollRememberActive()) return;
             saveScroll();
         });
 
@@ -681,12 +766,12 @@
 
     // ---- 供手勢導航使用 ----
     function saveForGesture() {
-        if (!ENABLE_SCROLL_REMEMBER) return;
+        if (!isScrollRememberActive()) return;
         saveScroll();
     }
 
     function restoreForGesture() {
-        if (!ENABLE_SCROLL_REMEMBER) return;
+        if (!isScrollRememberActive()) return;
         cancelAllPendingRestores();
         scheduleRestore(RESTORE_DELAY + 220);
     }
@@ -957,7 +1042,7 @@
     //  Public API
     // ============================================================
     const CombinedPluginAPI = {
-        isScrollEnabled: function() { return ENABLE_SCROLL_REMEMBER; },
+        isScrollEnabled: function() { return isScrollRememberActive(); },
         isGestureEnabled: function() { return ENABLE_GESTURE_NAVIGATION; },
         isLowPerformance: function() { return IS_LOW_PERFORMANCE; },
 
