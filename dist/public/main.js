@@ -4,15 +4,46 @@
     // ============================================================
     //  Config Loading
     // ============================================================
-    const config = typeof HFS !== 'undefined' && HFS.pluginConfig
-        ? HFS.pluginConfig
-        : {};
+    // 兼容多种 HFS 版本：优先 getPluginConfig()，其次 HFS.pluginConfig，
+    // 最后退到空对象。避免后端关闭后前端仍按默认 true 启用。
+    function readPluginConfig() {
+        try {
+            if (typeof window !== 'undefined' &&
+                window.HFS &&
+                typeof window.HFS.getPluginConfig === 'function') {
+                const c = window.HFS.getPluginConfig();
+                if (c && typeof c === 'object') return c;
+            }
+        } catch (e) { }
+        try {
+            if (typeof window !== 'undefined' &&
+                window.HFS &&
+                window.HFS.pluginConfig &&
+                typeof window.HFS.pluginConfig === 'object') {
+                return window.HFS.pluginConfig;
+            }
+        } catch (e) { }
+        return {};
+    }
 
-    const ENABLE_SCROLL_REMEMBER = config.enableScrollRemember !== false;
-    const ENABLE_GESTURE_NAVIGATION = config.enableGestureNavigation !== false;
+    const config = readPluginConfig();
+
+    function configBool(v, defaultValue) {
+        if (v === false || v === 'false' || v === 0 || v === '0') return false;
+        if (v === true || v === 'true' || v === 1 || v === '1') return true;
+        return defaultValue;
+    }
+
+    const ENABLE_SCROLL_REMEMBER = configBool(config.enableScrollRemember, true);
+    const ENABLE_GESTURE_NAVIGATION = configBool(config.enableGestureNavigation, true);
 
     // 從小時轉換為毫秒
-    const EXPIRE_HOURS = config.expireHours ?? 24;
+    const EXPIRE_HOURS = (function () {
+        const v = config.expireHours;
+        if (v === undefined || v === null || v === '') return 24;
+        const n = Number(v);
+        return isNaN(n) ? 24 : n;
+    })();
     const EXPIRE = EXPIRE_HOURS === 0
         ? Infinity
         : EXPIRE_HOURS * 60 * 60 * 1000;
@@ -193,7 +224,7 @@
     const IS_LOW_PERFORMANCE = PerformanceDetector.isLowPerformance();
 
     // 根據性能調整配置
-    const ENABLE_SMOOTH_SCROLL = config.enableSmoothScroll !== false && !IS_LOW_PERFORMANCE;
+    const ENABLE_SMOOTH_SCROLL = configBool(config.enableSmoothScroll, true) && !IS_LOW_PERFORMANCE;
     const SCROLL_DURATION = IS_LOW_PERFORMANCE ? 200 : 800;
     const RESTORE_DELAY = IS_LOW_PERFORMANCE ? 30 : 80;
     const URI_WATCH_INTERVAL = IS_LOW_PERFORMANCE ? 500 : 200;
@@ -784,6 +815,82 @@
         let startPoint = null;
         let isMultiTouch = false; // 標記是否為多指觸摸
 
+        // —— 雙指觸發後的放大避讓狀態 ——
+        // 一旦檢測到雙指動作，就進入避讓，直到圖片放大特徵消失。
+        let zoomAvoidActive = false;
+        let zoomAvoidTimer = null;
+        let zoomAvoidDeadline = 0;
+        const ZOOM_AVOID_POLL_MS = 250;
+        const ZOOM_AVOID_MAX_MS = 60000;
+
+        // 最小化避讓：檢測圖片瀏覽器是否處於放大模式。
+        // 不修改圖片瀏覽器插件，僅從其 DOM 推斷。
+        function isImageBrowserZoomed() {
+            try {
+                const viewer = document.querySelector('.file-show');
+                if (!viewer) return false;
+
+                // 優先：讀取倍數字樣按鈕
+                const resetBtn = viewer.querySelector('.ib-zoom-reset');
+                if (resetBtn) {
+                    const txt = (resetBtn.textContent || '').trim();
+                    if (txt && txt !== '1.0x') return true;
+                    if (txt === '1.0x') return false;
+                }
+
+                // 兜底：檢查主圖內聯 transform 是否帶 scale > 1
+                const showing = viewer.querySelector('img.showing');
+                if (showing) {
+                    const t = showing.style.transform || '';
+                    const m = t.match(/scale\(([\d.]+)\)/);
+                    if (m) {
+                        const s = parseFloat(m[1]);
+                        if (!isNaN(s) && s > 1.001) return true;
+                    }
+                }
+
+                // 兜底：容器 touch-action 被設為 none（放大時圖片瀏覽器會這麼做）
+                const container = viewer.querySelector('.showing-container');
+                if (container && container.style.touchAction === 'none') {
+                    return true;
+                }
+
+                return false;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        function stopZoomAvoidPolling() {
+            if (zoomAvoidTimer) {
+                clearInterval(zoomAvoidTimer);
+                zoomAvoidTimer = null;
+            }
+        }
+
+        function beginZoomAvoid() {
+            zoomAvoidActive = true;
+            zoomAvoidDeadline = Date.now() + ZOOM_AVOID_MAX_MS;
+            if (zoomAvoidTimer) return;
+            zoomAvoidTimer = setInterval(function() {
+                // 超過兜底時間，強制解除，避免異常卡死
+                if (Date.now() > zoomAvoidDeadline) {
+                    zoomAvoidActive = false;
+                    stopZoomAvoidPolling();
+                    return;
+                }
+                // 放大特徵消失 → 解除避讓
+                if (!isImageBrowserZoomed()) {
+                    zoomAvoidActive = false;
+                    stopZoomAvoidPolling();
+                }
+            }, ZOOM_AVOID_POLL_MS);
+        }
+
+        function isZoomAvoiding() {
+            return zoomAvoidActive || isImageBrowserZoomed();
+        }
+
         function getCurrentPath() {
             let path = location.pathname;
             if (path.length > 1 && path.endsWith('/')) {
@@ -898,6 +1005,9 @@
         }
 
         function triggerParentNavigation() {
+            // 避讓：圖片瀏覽器處於放大模式或雙指避讓期內，禁止手勢返回/關閉
+            if (isZoomAvoiding()) return;
+
             const now = Date.now();
             if (now - lastActionTime < GESTURE_CONFIG.COOLDOWN) return;
             lastActionTime = now;
@@ -917,8 +1027,21 @@
         }
 
         function handleTouchStart(e) {
+            // 已有避讓或當前放大 → 不記錄起點
+            if (isZoomAvoiding()) {
+                if (e.touches.length > 1) {
+                    // 再次雙指，續期避讓
+                    beginZoomAvoid();
+                }
+                isMultiTouch = true;
+                startPoint = null;
+                return;
+            }
+
             // 多指觸摸（如雙指縮放）→ 標記並放棄單指滑動判斷
             if (e.touches.length > 1) {
+                // 首次檢測到雙指：進入避讓，直到放大特徵消失
+                beginZoomAvoid();
                 isMultiTouch = true;
                 startPoint = null;
                 return;
@@ -936,6 +1059,14 @@
         }
 
         function handleTouchEnd(e) {
+            if (isZoomAvoiding()) {
+                if (e.touches.length === 0) {
+                    isMultiTouch = false;
+                }
+                startPoint = null;
+                return;
+            }
+
             // 多指觸摸結束 → 重置狀態，不觸發手勢
             if (isMultiTouch) {
                 if (e.touches.length === 0) {
@@ -976,6 +1107,7 @@
 
         function handleKeyDown(e) {
             if (!GESTURE_CONFIG.BACKSPACE_ENABLED) return;
+            if (isZoomAvoiding()) return;
 
             const activeElement = document.activeElement;
             const isContentEditable = activeElement && activeElement.isContentEditable;
