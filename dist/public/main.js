@@ -234,13 +234,13 @@
     //  Gesture Navigation Settings (Hardcoded)
     // ============================================================
     const GESTURE_CONFIG = {
-        MIN_SWIPE_DISTANCE: 90,
-        MAX_VERTICAL_DEVIATION: 50,
+        MIN_SWIPE_DISTANCE: 140,          // 水平滑動最小距離（px）
+        MAX_VERTICAL_DEVIATION: 50,      // 允許的垂直偏移上限（px）
         ACTIVATION_ZONE: {
-            TOP: 0.25,
-            BOTTOM: 0.75
+            TOP: 0.25,                   // 起始點 y 需 ≥ 視窗高度 25%
+            BOTTOM: 0.75                 // 起始點 y 需 ≤ 視窗高度 75%
         },
-        COOLDOWN: 300,
+        COOLDOWN: 300,                   // 兩次手勢之間的最小間隔（ms）
         BACKSPACE_ENABLED: true
     };
 
@@ -868,6 +868,69 @@
             }
         }
 
+        // —— Doc-viewer 文本編輯器避讓偵測 ——
+        // 依賴 Doc-viewer 插件固定 class（語言無關、版本無關）：
+        //   .dialog-backdrop.dv-dialog-fullscreen  → 編輯器全屏對話框
+        //   .dv-workspace                          → 編輯器工作區根
+        //   textarea.dv-editor-textarea            → 真正的輸入框
+        //   textarea.npm__react-simple-code-editor__textarea → 底層編輯器固定 class
+        function isDocViewerEditing() {
+            try {
+                // 1) 編輯器對話框存在且可見 → 直接視為編輯中
+                const dialog = document.querySelector('.dialog-backdrop.dv-dialog-fullscreen');
+                if (dialog) {
+                    if (dialog.offsetParent !== null) return true;
+                    if (getComputedStyle(dialog).display !== 'none') return true;
+                }
+                // 2) 工作區存在（涵蓋 dialog class 尚未加上時的短暫窗口）
+                if (document.querySelector('.dv-workspace')) return true;
+                // 3) 輸入框存在（保險）
+                if (document.querySelector(
+                    'textarea.dv-editor-textarea, textarea.npm__react-simple-code-editor__textarea'
+                )) return true;
+                return false;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // —— Tree-nav 側邊欄避讓偵測 ——
+        // 依賴 tree-nav 插件固定 class（語言無關）：
+        //   .hfs-tree-nav / .hfs-tree-shell      → 側邊欄容器
+        //   .tree-scroll                         → 樹的滾動區
+        //   .tree-resizer / .tree-resizer-grip   → 拖拽調整大小手柄
+        //   .tree-fab                            → 展開浮動按鈕
+        // 只判斷「事件目標是否落在側邊欄內」，不查整個 document，
+        // 避免側邊欄存在時全頁面都無法手勢。
+        function isInsideTreeNav(target) {
+            if (!target || typeof target.closest !== 'function') return false;
+            try {
+                return !!target.closest(
+                    '.hfs-tree-nav, .hfs-tree-shell, .tree-scroll, ' +
+                    '.tree-resizer, .tree-resizer-grip, .tree-fab'
+                );
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // —— Doc-viewer 子對話框（History / Unsaved）偵測 ——
+        // 這兩者不是 .dialog-backdrop，需單獨識別。
+        // 手勢在此只「吞掉」不返回上一層，也不自動點按鈕（避免誤存/誤丟）。
+        function hasDocViewerSubDialog() {
+            try {
+                const unsaved = document.querySelector('.dv-unsaved-backdrop');
+                if (unsaved && (unsaved.offsetParent !== null ||
+                    getComputedStyle(unsaved).display !== 'none')) return true;
+                const history = document.querySelector('.dv-history-backdrop');
+                if (history && (history.offsetParent !== null ||
+                    getComputedStyle(history).display !== 'none')) return true;
+                return false;
+            } catch (e) {
+                return false;
+            }
+        }
+
         function beginZoomAvoid() {
             zoomAvoidActive = true;
             zoomAvoidDeadline = Date.now() + ZOOM_AVOID_MAX_MS;
@@ -888,7 +951,7 @@
         }
 
         function isZoomAvoiding() {
-            return zoomAvoidActive || isImageBrowserZoomed();
+            return zoomAvoidActive || isImageBrowserZoomed() || isDocViewerEditing();
         }
 
         function getCurrentPath() {
@@ -1005,8 +1068,11 @@
         }
 
         function triggerParentNavigation() {
-            // 避讓：圖片瀏覽器處於放大模式或雙指避讓期內，禁止手勢返回/關閉
+            // 避讓：圖片瀏覽器放大 / 雙指避讓期 / Doc-viewer 編輯器 → 禁止手勢返回/關閉
             if (isZoomAvoiding()) return;
+
+            // ★ Tree-nav：焦點在側邊欄內時不觸發
+            if (isInsideTreeNav(document.activeElement)) return;
 
             const now = Date.now();
             if (now - lastActionTime < GESTURE_CONFIG.COOLDOWN) return;
@@ -1014,10 +1080,15 @@
 
             const activeElement = document.activeElement;
             const isContentEditable = activeElement && activeElement.isContentEditable;
-            const isInputField = activeElement &&
-                ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName);
+            const isInputField = (activeElement &&
+                ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName)) ||
+                isDocViewerEditing();
 
             if (isContentEditable || isInputField) return;
+
+            // Doc-viewer 子對話框（History / Unsaved）→ 只吞掉，不返回、不自動點按鈕
+            // （Unsaved 有 Save/Discard/Cancel，自動點會誤存/誤丟，交由使用者操作）
+            if (hasDocViewerSubDialog()) return;
 
             // 有對話框 → 只關閉，直接結束（不返回上一層）
             if (tryCloseOpenDialog()) return;
@@ -1038,6 +1109,14 @@
                 return;
             }
 
+            // ★ Tree-nav 側邊欄內觸摸 → 完全不捕捉手勢
+            // （允許側邊欄內部滾動 / 拖拽調整大小 / 點擊導航）
+            if (isInsideTreeNav(e.target)) {
+                isMultiTouch = false;
+                startPoint = null;
+                return;
+            }
+
             // 多指觸摸（如雙指縮放）→ 標記並放棄單指滑動判斷
             if (e.touches.length > 1) {
                 // 首次檢測到雙指：進入避讓，直到放大特徵消失
@@ -1049,6 +1128,14 @@
 
             // 單指觸摸
             if (e.touches.length === 1) {
+                // Doc-viewer 編輯器內：吞掉手勢，但不進入雙指輪詢避讓
+                // （isDocViewerEditing 已由 isZoomAvoiding 在函數頂部攔截，
+                //   此處為雙重保險，避免 startPoint 被記錄後 touchend 又觸發）
+                if (isDocViewerEditing()) {
+                    isMultiTouch = false;
+                    startPoint = null;
+                    return;
+                }
                 isMultiTouch = false;
                 startPoint = {
                     x: e.touches[0].clientX,
@@ -1059,7 +1146,8 @@
         }
 
         function handleTouchEnd(e) {
-            if (isZoomAvoiding()) {
+            // ★ Tree-nav：終點落在側邊欄內也一併吞掉
+            if (isZoomAvoiding() || isDocViewerEditing() || isInsideTreeNav(e.target)) {
                 if (e.touches.length === 0) {
                     isMultiTouch = false;
                 }
@@ -1107,7 +1195,9 @@
 
         function handleKeyDown(e) {
             if (!GESTURE_CONFIG.BACKSPACE_ENABLED) return;
-            if (isZoomAvoiding()) return;
+            if (isZoomAvoiding() || isDocViewerEditing()) return;
+            // ★ Tree-nav：焦點在側邊欄內 → 不攔截 Backspace
+            if (isInsideTreeNav(document.activeElement)) return;
 
             const activeElement = document.activeElement;
             const isContentEditable = activeElement && activeElement.isContentEditable;
@@ -1115,6 +1205,8 @@
                 ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName);
 
             if (e.keyCode === 8 && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
+                // Doc-viewer 編輯器內：Backspace 交給編輯器自己處理（刪字/退格）
+                if (isDocViewerEditing()) return;
                 if (!isContentEditable && !isInputField) {
                     e.preventDefault();
                     e.stopPropagation();
