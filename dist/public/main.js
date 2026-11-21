@@ -234,7 +234,7 @@
     //  Gesture Navigation Settings (Hardcoded)
     // ============================================================
     const GESTURE_CONFIG = {
-        MIN_SWIPE_DISTANCE: 140,          // 水平滑動最小距離（px）
+        MIN_SWIPE_DISTANCE: 100,          // 水平滑動最小距離（px）
         MAX_VERTICAL_DEVIATION: 50,      // 允許的垂直偏移上限（px）
         ACTIVATION_ZONE: {
             TOP: 0.25,                   // 起始點 y 需 ≥ 視窗高度 25%
