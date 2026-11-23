@@ -1,6 +1,6 @@
 exports.version = 2.3
 exports.apiRequired = 8.87
-exports.repo = "Hug3O/Navigation-Optimizer"
+exports.repo = "hugo529100/hfs-Navigation-Optimizer"
 exports.description = "Navigation Optimizer: Scroll position memory + Gesture navigation for HFS"
 
 exports.config = {
