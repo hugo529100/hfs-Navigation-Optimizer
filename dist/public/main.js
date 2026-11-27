@@ -49,7 +49,7 @@
         : EXPIRE_HOURS * 60 * 60 * 1000;
 
     // ============================================================
-    //  Options 界面：滾動記憶前端開關（默認開啟）
+    //  Options 界面：滾動記憶前端開關（默認關閉）
     // ============================================================
     const STORAGE_KEY_SCROLL_UI = 'hfs_scroll_remember_ui_enabled';
     const TOGGLE_ID = 'scroll-remember-toggle';
@@ -65,9 +65,10 @@
     }
 
     function getScrollUiEnabled() {
-        if (!isLocalStorageSupported()) return true;
+        // 默認關閉：localStorage 不可用時也視為關閉
+        if (!isLocalStorageSupported()) return false;
         const val = localStorage.getItem(STORAGE_KEY_SCROLL_UI);
-        return val === null ? true : val === 'true';   // 默認開啟
+        return val === null ? false : val === 'true';   // 默認關閉
     }
 
     function setScrollUiEnabled(value) {
@@ -83,6 +84,9 @@
 
     // 向 Options 對話框注入開關
     function insertScrollToggle() {
+        // 後端關閉滾動記憶 → 前端開關不顯示
+        if (!ENABLE_SCROLL_REMEMBER) return;
+
         const optionsDialog = document.querySelector('.dialog[aria-modal="true"]');
         if (!optionsDialog || document.getElementById(TOGGLE_ID)) return;
 
